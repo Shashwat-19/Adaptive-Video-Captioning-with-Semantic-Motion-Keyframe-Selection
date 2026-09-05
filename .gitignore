@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Notebooks and editors
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# Local planning brief; it contains an example personal Drive path.
+research/task.md
+
+# Data and generated research artifacts
+data/
+datasets/
+artifacts/
+cache/
+checkpoints/
+models/
+outputs/
+results/figures/*
+results/metrics/*
+results/samples/*
+!results/figures/.gitkeep
+!results/metrics/.gitkeep
+!results/samples/.gitkeep
+
+# Raw media and learned weights
+*.avi
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
