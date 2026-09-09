@@ -19,3 +19,4 @@ rouge-score==0.1.2
 evaluate==0.4.3
 wordcloud==1.9.3
 pytest==8.3.3
+kagglehub>=0.2.0

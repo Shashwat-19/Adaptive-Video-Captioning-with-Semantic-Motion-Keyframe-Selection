@@ -159,14 +159,28 @@ cache/
 
 ## Data
 
-The workflow is built around MSVD.
+The workflow is built around the MSVD (Microsoft Research Video Description) dataset corpus.
 
-- Split strategy: unique video ID, not caption-row randomization
-- Supported caption schemas: flexible CSV, TSV, and JSON parsing
-- Dataset checks: video count, caption count, missing file count, sample records
-- Configured locations: `DATA_ROOT`, `VIDEO_DIR`, `CAPTION_FILE`
+### Dataset Acquisition (Kaggle)
 
-Example MSVD layout:
+The MSVD dataset can be obtained from Kaggle using the `kagglehub` package.
+
+- **Kaggle Dataset Identifier**: `vtrnanh/msvd-dataset-corpus`
+
+To download the dataset programmatically:
+
+```python
+import kagglehub
+
+path = kagglehub.dataset_download("vtrnanh/msvd-dataset-corpus")
+print("Path to dataset files:", path)
+```
+
+> **Important**: Do **NOT** commit the downloaded dataset, raw video files, or extracted frames into Git. The repository's `.gitignore` excludes `/data/`, `/datasets/`, and raw video formats (`*.avi`, `*.mp4`, etc.).
+
+### Dataset Layout & Configuration
+
+Once downloaded, set `DATA_ROOT` (or the `MSVD_DATA_ROOT` environment variable) to the downloaded dataset path. The expected directory structure is:
 
 ```text
 msvd/
@@ -176,6 +190,12 @@ msvd/
 │   └── ...
 └── captions.csv
 ```
+
+- **Split strategy**: unique video ID (disjoint train, validation, and test sets), not caption-row randomization
+- **Supported caption schemas**: flexible CSV, TSV, and JSON parsing
+- **Dataset checks**: video count, caption count, missing file count, sample records
+- **Configured locations**: `DATA_ROOT` (or `MSVD_DATA_ROOT`), `VIDEO_DIR` (or `MSVD_VIDEO_DIR`), `CAPTION_FILE` (or `MSVD_CAPTION_FILE`)
+
 
 Example caption records:
 

@@ -32,11 +32,11 @@ import os, json, random, time, gc, math, warnings
 
 @dataclass
 class ResearchConfig:
-    # Set these three values only when configuring a new MSVD location.
-    DATA_ROOT: str = "/content/msvd"
-    VIDEO_DIR: str = "YouTubeClips"
-    CAPTION_FILE: str = "captions.csv"
-    OUTPUT_DIR: str = "/content/video_captioning_outputs"
+    # Configurable MSVD paths; can be set directly or overridden by environment variables.
+    DATA_ROOT: str = os.environ.get("MSVD_DATA_ROOT", "/content/msvd")
+    VIDEO_DIR: str = os.environ.get("MSVD_VIDEO_DIR", "YouTubeClips")
+    CAPTION_FILE: str = os.environ.get("MSVD_CAPTION_FILE", "captions.csv")
+    OUTPUT_DIR: str = os.environ.get("OUTPUT_DIR", "/content/video_captioning_outputs")
     SEED: int = 42
     NUM_CANDIDATE_FRAMES: int = 30
     NUM_SELECTED_FRAMES: int = 8
@@ -136,10 +136,16 @@ def normalize_captions(raw: pd.DataFrame) -> pd.DataFrame:
     def pick(options): return next((lookup[x] for x in options if x in lookup), None)
     id_col = pick(["video_id", "video", "video_name", "videoid", "clip_id", "filename", "file_name"])
     caption_col = pick(["caption", "description", "sentence", "text", "caption_text"])
+    start_col, end_col = pick(["start"]), pick(["end"])
     if not id_col or not caption_col:
         raise ValueError(f"Cannot map video/caption columns. Found {list(raw.columns)}; edit normalize_captions().")
     out = raw.copy().rename(columns={id_col:"video_id", caption_col:"caption"})
-    out["video_id"] = out.video_id.astype(str).str.strip().str.replace(r"\\.(avi|mp4|webm|mov)$", "", regex=True, case=False)
+    if start_col and end_col:
+        out["video_id"] = (out["video_id"].astype(str).str.strip() + "_" +
+                            out[start_col].astype(str).str.strip() + "_" +
+                            out[end_col].astype(str).str.strip())
+    else:
+        out["video_id"] = out.video_id.astype(str).str.strip().str.replace(r"\.(avi|mp4|webm|mov)$", "", regex=True, case=False)
     out["caption"] = out.caption.astype(str).str.strip()
     return out[out.caption.ne("") & out.video_id.ne("")].reset_index(drop=True)
 
