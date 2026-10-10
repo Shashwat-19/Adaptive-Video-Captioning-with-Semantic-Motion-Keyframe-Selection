@@ -4,6 +4,7 @@ from video_captioning.data.dataset import (
     discover_caption_file,
     index_video_paths,
     normalize_captions,
+    normalize_segment,
     read_caption_table,
     split_by_video_id,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "index_video_paths",
     "inspect_video",
     "normalize_captions",
+    "normalize_segment",
     "read_caption_table",
     "split_by_video_id",
 ]

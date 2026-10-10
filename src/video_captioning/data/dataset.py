@@ -31,17 +31,40 @@ def discover_caption_file(root: Path, configured: Path) -> Path:
 
 
 def read_caption_table(path: str | Path) -> pd.DataFrame:
-    """Read CSV, TSV, or JSON captions into a dataframe without schema assumptions."""
+    """Read CSV, TSV, or JSON captions into a dataframe without schema assumptions.
+
+    Files are decoded as ``utf-8-sig``, as in the notebook, so a byte-order mark does not end up
+    in the first column name.
+    """
     path = Path(path)
     if path.suffix.lower() == ".json":
-        with path.open(encoding="utf-8") as handle:
+        with path.open(encoding="utf-8-sig") as handle:
             raw = json.load(handle)
         return pd.json_normalize(raw if isinstance(raw, list) else raw.get("data", raw))
-    return pd.read_csv(path, sep="\t" if path.suffix.lower() == ".tsv" else None, engine="python")
+    return pd.read_csv(
+        path, sep="\t" if path.suffix.lower() == ".tsv" else None, engine="python", encoding="utf-8-sig"
+    )
 
 
-def normalize_captions(raw: pd.DataFrame) -> pd.DataFrame:
-    """Map common MSVD column names to non-empty ``video_id`` and ``caption`` fields."""
+def normalize_segment(value: object) -> str:
+    """Write a segment bound so 33, 33.0, and "33.0" all become "33", matching video file stems."""
+    text = str(value).strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if not np.isfinite(number):
+        return text
+    return str(int(number)) if number.is_integer() else format(number, "g")
+
+
+def normalize_captions(raw: pd.DataFrame, language: str | None = "english") -> pd.DataFrame:
+    """Map common MSVD column names to non-empty ``video_id`` and ``caption`` fields.
+
+    When the table has a ``Language`` column, only rows whose language matches ``language``
+    (case-insensitive) are kept; pass ``language=None`` to keep every row. Rows with a missing
+    video ID, caption, or segment bound are dropped.
+    """
     lookup = {
         str(column).strip().lower().replace(" ", "_").replace("-", "_"): column
         for column in raw.columns
@@ -54,20 +77,24 @@ def normalize_captions(raw: pd.DataFrame) -> pd.DataFrame:
     caption_column = pick(["caption", "description", "sentence", "text", "caption_text"])
     start_column = pick(["start", "start_time", "start_frame"])
     end_column = pick(["end", "end_time", "end_frame"])
+    language_column = pick(["language"])
     if not id_column or not caption_column:
         raise ValueError(
             "Cannot map video/caption columns. "
             f"Found {list(raw.columns)}; update normalize_captions() for this schema."
         )
     normalized = raw.copy().rename(columns={id_column: "video_id", caption_column: "caption"})
-    if start_column and end_column:
-        normalized["video_id"] = (
-            normalized["video_id"].astype(str).str.strip()
-            + "_"
-            + normalized[start_column].astype(str).str.strip()
-            + "_"
-            + normalized[end_column].astype(str).str.strip()
-        )
+    if language is not None and language_column:
+        spoken = normalized[language_column].astype(str).str.strip().str.casefold()
+        normalized = normalized.loc[spoken.eq(language.strip().casefold())]
+    segment_columns = [start_column, end_column] if start_column and end_column else []
+    normalized = normalized.dropna(subset=["video_id", "caption", *segment_columns])
+    if segment_columns:
+        # astype(str) keeps an empty selection string-typed; map() leaves it numeric.
+        start = normalized[start_column].map(normalize_segment).astype(str)
+        end = normalized[end_column].map(normalize_segment).astype(str)
+        normalized["video_id"] = normalized["video_id"].astype(str).str.strip() + "_" + start + "_" + end
+        normalized = normalized.loc[start.ne("") & end.ne("")]
     else:
         normalized["video_id"] = (
             normalized["video_id"]
@@ -75,7 +102,7 @@ def normalize_captions(raw: pd.DataFrame) -> pd.DataFrame:
             .str.strip()
             .str.replace(r"\.(avi|mp4|webm|mov|mkv)$", "", regex=True, case=False)
         )
-    normalized["caption"] = normalized["caption"].astype(str).str.strip()
+    normalized["caption"] = normalized["caption"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     return normalized.loc[
         normalized["video_id"].ne("") & normalized["caption"].ne("")
     ].reset_index(drop=True)
