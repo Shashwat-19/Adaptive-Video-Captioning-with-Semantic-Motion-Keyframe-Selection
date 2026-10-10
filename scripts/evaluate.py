@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -15,6 +16,11 @@ import pandas as pd
 from video_captioning.data.dataset import normalize_captions, read_caption_table
 from video_captioning.evaluation.metrics import evaluate_captions
 from video_captioning.utils.config import load_config
+
+
+def json_ready(metrics: dict[str, float]) -> dict[str, float | None]:
+    """Replace unavailable (NaN) metrics, such as CIDEr without pycocoevalcap, with null."""
+    return {name: None if isinstance(value, float) and math.isnan(value) else value for name, value in metrics.items()}
 
 
 def main() -> None:
@@ -32,7 +38,7 @@ def main() -> None:
     captions = normalize_captions(read_caption_table(config.caption_path))
     references = captions.groupby("video_id")["caption"].apply(list).to_dict()
     metrics = evaluate_captions(predictions.to_dict("records"), references)
-    rendered = json.dumps(metrics, indent=2, allow_nan=True)
+    rendered = json.dumps(json_ready(metrics), indent=2, allow_nan=False)
     print(rendered)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
