@@ -221,7 +221,7 @@ The notebook saves:
 
 ## Training
 
-The notebook includes T4-conscious fine-tuning paths.
+The notebook includes T4-conscious fine-tuning paths. Each fine-tuning arm (`uniform` and `semantic_motion_diverse`) keeps the epoch with the lowest validation loss and records it in `best_checkpoint.json`, written only after the run finishes. A run that is interrupted, or whose validation loss is not finite, leaves no pointer. `freeze_test_configuration` stores each arm's checkpoint path and a SHA-256 hash of its files with the frozen configuration. When `RUN_TEST_ABLATIONS` is on, `run_ablation` includes the fine-tuned arms only if the frozen configuration names checkpoints for them; it then scores them alongside the zero-shot methods on one paired set of test videos. It refuses to start if either arm is missing from the freeze, or if a frozen checkpoint is gone or its files changed. If the freeze was recorded before training, the ablation runs zero-shot only. The alpha sweep uses the zero-shot base model by default, so the frozen alpha is tuned on the base model; pass `checkpoint=` to `plot_alpha_sensitivity` to tune it on a fine-tuned checkpoint instead. Two limits are still open (see `notebooks/TODO.md`): the arms train with whatever `ALPHA` is set when Section 15 runs, which can differ from the frozen alpha, and the freeze check does not cover every generation setting (for example the prompt and `num_beams`). The fine-tuned arms' test captions have not been generated yet.
 
 - mixed precision where available
 - small batch sizes

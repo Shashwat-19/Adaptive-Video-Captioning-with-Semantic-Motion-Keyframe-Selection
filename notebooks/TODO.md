@@ -1,0 +1,145 @@
+# TODO: `video_captioning_research-4.ipynb`
+
+Scope: `notebooks/video_captioning_research-4.ipynb`, all 65 cells, including saved outputs.
+Date: 2026-10-11. Written from reading the committed notebook. Nothing was run.
+
+**How to apply fixes:** `CLAUDE.md` forbids hand-editing generated notebooks. Make each fix in `scripts/build_notebook.py`, regenerate the notebook, then check the cell diff. The builder was synced to the committed notebook's cells; since then, only the work on the first P0 item changes it (cells 33, 39, 45, 47). The builder still writes `notebooks/video_captioning_research.ipynb`, not the `-4` name, so do not regenerate into `notebooks/` until that filename is decided. Check changes by generating into a temp directory.
+
+**Labels:** *(by reading)* comes from the code and saved outputs. *(verify)* needs a run on a fresh runtime or the real MSVD CSV.
+
+---
+
+## P0: results are invalid or cannot be reproduced
+
+- [ ] **Fine-tuned models are trained but never evaluated**
+  - Where: cell 39 (`run_finetuning`), cell 41 (`generate_for_ids`, `checkpoint=` arg), cells 45, 47, 49, 54 (all generate with the base model). The only fine-tuned call is commented out in cell 41.
+  - Problem: the proposed-vs-uniform comparison has no test output from the fine-tuned checkpoints. The alpha sweep (cell 45) also tunes on base-model captions.
+  - Also: cell 39 never records which `epoch_N` has the lowest validation loss, so no test step can find the best checkpoint. Passing `checkpoints/proposed` to `load_checkpoint` fails, because that folder has no `adapter_config.json`.
+  - Fix: after training, pick the epoch with the lowest validation loss and write its path into the frozen config. Add test generation and scoring for each fine-tuned arm, using the same paired-ID rule as the ablation. Decide whether alpha is tuned on the base model or a fine-tuned checkpoint, and state it in the notebook.
+  - Done in the builder (2026-10-11, not run):
+    - Cell 39 writes `best_checkpoint.json` for the lowest-validation-loss epoch. It deletes any old pointer when a run starts, and raises on a non-finite validation loss.
+    - Cell 45: `freeze_test_configuration` records each arm's checkpoint path and a SHA-256 of its files. `plot_alpha_sensitivity(checkpoint=...)` can tune alpha on a fine-tuned model; the default stays the base model, and README and methodology say so.
+    - Cell 47: `run_ablation(include_finetuned=True)` checks the frozen checkpoints before generating, then scores the fine-tuned arms with the zero-shot methods on one paired test-ID set.
+    - Cell 33: `load_checkpoint` skips the reload when that checkpoint is already loaded.
+  - Still open, tracked as separate items: the training-vs-test alpha mismatch (P0 below) and the missing freeze-guard fields (P1). No fine-tuned test captions exist yet; that needs a GPU run.
+
+- [ ] **Clips from the same YouTube video can land in different splits** *(verify on the real CSV)*
+  - Where: cell 13 builds `video_id = VideoID_Start_End`. Cell 17 splits on that key. The sample output in cell 19 shows `-8y1Q0rA3n8_95_102` and `-8y1Q0rA3n8_108_115` as separate IDs from one source video.
+  - Problem: the split prevents clip-level overlap only. Clips from one source video share a scene, so a test clip can have a near-duplicate in train, which inflates test scores.
+  - Fix: count clips per YouTube ID. If any are shared, split on the YouTube ID (the part before the first `_`), regenerate the split files and `split_metadata.json`, and update the split table. No earlier split output can be reused.
+
+- [ ] **Pinned package versions are not enforced, and the recorded run does not match the pins**
+  - Where: cell 7 installs a package only when `find_spec` finds nothing. The cell 7 output says `Missing packages: ['rouge-score==0.1.2', 'evaluate==0.4.3']`. The version report (cell 7 output) records `transformers` 5.16.1 (pinned 4.45.2), `peft` 0.20.0 (pinned 0.12.0), `opencv` 5.0.0 (pinned 4.10.0.84), `accelerate` 1.14.0 (pinned 0.34.2), and Python 3.13.15.
+  - Problem: the numbers in this run came from a different stack than the one the pins describe. Nothing checks the installed versions against the pins.
+  - Fix: compare `importlib.metadata.version(pkg)` with each pin in cell 7, and raise on mismatch. Save the mismatch to `configs/environment_versions.json`. Pin the Python version the notebook supports and say so in the first cell.
+  - *(verify)* On transformers 5.x, `from_pretrained(..., load_in_4bit=True)` (cell 33) may no longer be supported. Check the `USE_4BIT` path before enabling it.
+
+- [ ] **Metrics use different tokenization**
+  - Where: cell 43, `evaluate_captions`. BLEU and METEOR call `str.split()` on raw strings. ROUGE-L uses `rouge_score`'s tokenizer with a stemmer, which lowercases and strips punctuation.
+  - Problem: `"dog."` and `"dog"` are different tokens for BLEU and METEOR but the same for ROUGE-L. The four scales are not comparable, and the scores are not comparable with published MSVD numbers, which use PTB-style tokenization.
+  - Also: CIDEr is NaN on a fresh runtime. The `required` dict in cell 7 does not include `pycocoevalcap`, so `evaluate_captions` only prints "CIDEr unavailable".
+  - Fix: use one normalization function (lowercase, strip punctuation, collapse whitespace) for references and hypotheses in every metric. Install `pycocoevalcap` in cell 7. Document the tokenizer in the notebook. Check how much scores move on a small sample before recording results.
+
+- [ ] **Training and inference use different prompts** *(by reading; verify)*
+  - Where: cell 37 (`collate_caption_batch`) trains on the caption text only. Cell 33 (`generate_caption`, default `prompt="A short video of"`) generates after that prompt.
+  - Problem: the fine-tuned model is queried with a prefix it never saw in training.
+  - Also: cell 35 (the zero-shot smoke test) is commented out, so the committed notebook never shows whether the prompt appears in decoded captions.
+  - Fix: pick one prompt format and use it in both training and inference. Mask prompt tokens out of the loss if the prompt is kept. Add an assertion that generated captions do not contain prompt text. Run the smoke test and record whether captions start with the prompt.
+
+- [ ] **Alpha used in training differs from alpha used in testing** *(by reading)*
+  - Where: cell 37 (`VideoCaptionDataset`) calls `select_frames(vid, method)` with `alpha=None`, which reads `CFG.ALPHA` (cell 31). Cell 45 changes `CFG.ALPHA` through `freeze_test_configuration`, which runs later.
+  - Problem: the fine-tuned arms train with the prespecified alpha (0.5), but the test uses the frozen alpha.
+  - Fix: write the training alpha into `best_checkpoint`-style metadata. Either train with the frozen alpha (run the sweep first) or state in the notebook that training uses the prespecified alpha.
+
+---
+
+## P1: configuration and correctness
+
+- [ ] **Section 0 paths do not control the run**
+  - Where: cell 2 writes `VIDEO_DIR`, `CAPTION_FILE`, and `OUTPUT_DIR` into `experiment_config.json`. Cell 11 hardcodes `data/extracted/videos`. Cell 13 hardcodes the annotation path and ignores `CAPTION_FILE`. Cell 60 hardcodes `OUT = Path("/content/video_captioning_outputs")`, overriding cells 2 and 13.
+  - Problem: the saved config records paths that the run did not use.
+  - Fix: make Section 0 the only source for these paths. Remove the hardcoded `OUT` in cell 60. Make cell 2 record the paths the run actually used.
+
+- [ ] **Annotation CSV is never downloaded**
+  - Where: cell 13 searches for `MSR Video Description Corpus.csv` and, if missing, raises an error that tells the user to "Run the automatic annotation download cell first". No such cell exists.
+  - Problem: on a fresh runtime cell 13 fails, and the message points at a cell that is not there.
+  - Fix: add an annotation download step with an MD5 check (same pattern as the video archive in cell 11), or fix the error message and name the file's source. *(verify on a fresh runtime)*
+
+- [ ] **The Kaggle step does not provide the data it describes**
+  - Where: cell 9 (section 1b). The saved output says `WARNING: no video files found in the downloaded dataset`, then cell 11 downloads the official archive.
+  - Problem: the section header says Kaggle is the acquisition path, but in the saved run it added only a failed download.
+  - Fix: remove the Kaggle step, or mark it as an optional mirror that runs only when cell 11 is skipped. Update the section header to match.
+
+- [ ] **Frame-budget study changes frame size along with frame count** *(by reading)*
+  - Where: `make_contact_sheet` (cell 33) tiles frames into a grid of 224-px cells, then the BLIP-2 processor resizes the whole sheet to 224×224. With 8 frames the grid is 3×3 (one cell empty, each frame about 75 px). With 16 frames it is 4×4 (each frame about 56 px).
+  - Problem: cell 49 changes the frame count and the per-frame resolution together, so caption differences cannot be attributed to frame count alone.
+  - Fix: decide before running the study. Either fix per-frame resolution across budgets, or fill the empty cell and report the resolution in the notebook. Record which one was used.
+
+- [ ] **Test-freeze guard checks too few fields** *(by reading)*
+  - Where: cell 45, `assert_test_configuration_frozen`. It checks `SEED`, `NUM_CANDIDATE_FRAMES`, `ALPHA`, `MIN_TEMPORAL_DISTANCE`, and `MODEL_NAME`. It does not check `IMAGE_SIZE`, `MAX_CAPTION_LENGTH`, `USE_LORA`, the prompt, or the hardcoded `num_beams=3` in cell 33.
+  - Status 2026-10-11: fine-tuned checkpoint paths and file hashes are checked, but only inside `run_ablation` through `frozen_finetuned_checkpoints` (cell 47), not in `assert_test_configuration_frozen`. Those checks run only when `RUN_TEST_ABLATIONS` is on.
+  - Fix: add the remaining generation settings to the frozen record and to `assert_test_configuration_frozen`. Move the checkpoint check into the guard as well, so it covers the frame-budget study too.
+
+- [x] **Training loop can save no checkpoint, or a stale one** *(by reading; addressed by the first P0 item, 2026-10-11)*
+  - Where: cell 39. `validate` (cell 37) returns NaN when the validation loader is empty.
+  - Done: `run_finetuning` deletes any old best-checkpoint pointer when it starts, and it writes the new pointer only after the epoch loop finishes. A run that is interrupted (out of memory, disconnect, or a non-finite validation loss) therefore leaves no pointer, and a later freeze cannot pick up an unfinished run.
+  - Remaining gap: none known in the code. Not run on a GPU yet, so re-check after the first real run.
+
+- [ ] **Architecture figure is saved outside the results folder** *(by reading)*
+  - Where: cell 4. Because `ROOT` is defined, the figure is written to `ROOT/artifacts/figures`. The saved output shows `/content/msvd/artifacts/figures/architecture.png`.
+  - Problem: the figure is missing from the artifact manifest (cell 59) and the gallery (cells 60–62), which both scan `OUT/results/figures`.
+  - Fix: always save to `OUT/results/figures`.
+
+- [ ] **Deprecated AMP calls** *(by reading)*
+  - Where: cell 37 (`torch.cuda.amp.autocast` in `train_one_epoch` and `validate`) and cell 39 (`torch.cuda.amp.GradScaler`).
+  - Fix: use `torch.amp.autocast("cuda", enabled=...)` and `torch.amp.GradScaler("cuda", enabled=...)`.
+
+- [ ] **Metadata sample is reported as if it were the full dataset** *(by reading)*
+  - Where: cell 19. With `RUN_FULL_METADATA = False`, only the first 25 videos are inspected. The cell prints "Unreadable videos logged: 0", which reads as a dataset-wide count. The plot titles do not say it is a sample.
+  - Fix: print "inspected 25 of 1,970", and put the same in the plot titles.
+
+- [ ] **Final results table can mix paired-ID sets** *(by reading)*
+  - Where: cell 56 (`final_results_table`) combines the ablation table and the budget table. Each is scored on its own paired-ID set (cells 47 and 49).
+  - Problem: CIDEr is only comparable on the same video IDs (`research/methodology.md` says so). Mixing sets breaks that.
+  - Fix: use one paired-ID set across all methods, or keep budget rows out of `final_results.csv`.
+
+- [ ] **Final results table drops the Checkpoint column and mixes in budget rows** *(by reading; restated 2026-10-11)*
+  - Where: cell 56. The fine-tuned rows reach `final_results.csv` through `ablation`, but the `reindex` keeps only the listed columns, so the `Checkpoint` column written by `run_ablation` is dropped. `budget_results` rows (different frame counts) are concatenated into the same table.
+  - Fix: keep `Checkpoint` in the output, and either write budget rows to their own file or add a column that separates them. Cell 64 still says to interpret results after a frozen test pass; that pass now exists in code but has not been run.
+
+---
+
+## P2: presentation and cleanup
+
+- [ ] **Saved outputs hide figures and headings** *(by reading)*
+  - Where: cells 61 and 62 print `<IPython.core.display.Markdown object>` and `<IPython.core.display.Image object>` where the content should be. On GitHub the figure gallery is empty.
+  - Fix: re-run and save outputs after the notebook source is settled, or leave the gallery out of the committed file.
+
+- [ ] **Conclusions mention SPICE, which the notebook never computes** *(by reading)*
+  - Where: cell 64, "Treat CIDEr/SPICE as optional".
+  - Fix: remove SPICE, or add it along with its Java dependency.
+
+- [ ] **EDA includes test captions** *(by reading)*
+  - Where: cell 15 runs before the split (cell 17) and uses every caption, including test captions.
+  - Problem: this is descriptive only, so it is not leakage. But choices informed by it (such as `MAX_CAPTION_LENGTH` = 32) were made with test data in view.
+  - Fix: compute the statistics on the train split, or say in the notebook that they include all splits.
+
+- [ ] **Commented-out cells mean the committed run produces no results** *(by reading)*
+  - Where: cells 35 (zero-shot), 41 (example generation), 45 (alpha sweep), 51 (efficiency), 54 (qualitative), and cell 56, whose saved output is an empty table.
+  - Fix: once a run is recorded, keep the outputs of each cell with the results they produce.
+
+- [ ] **Small cell-level issues** *(by reading)*
+  - Cell 43 downloads `omw-1.4` as well as `wordnet`. Only `wordnet` is needed.
+  - Cell 13, `normalize_segment` raises on a missing value and stops the cell. Choose one behavior (raise or drop the row) and document it.
+  - Cell 39, `run_finetuning` relies on the global torch seed and on `random.choice` in the dataset, with no explicit `generator` on the DataLoader. Make the seed explicit for the loader.
+  - Cell 59 reads `RUN_ID` and `MODE`, which are never defined in the notebook. The manifest records `null` for both.
+
+---
+
+## Suggested order
+
+1. Split leakage and pinned stack. These decide whether any later number means anything.
+2. Metric tokenization and the training/inference prompt. Fix before any test run.
+3. Fine-tuned evaluation, then the alpha question and the test-freeze fields.
+4. P1 items, starting with the Section 0 paths and the annotation download, since fresh-runtime runs depend on them.
+5. P2 presentation items once the notebook source is settled.

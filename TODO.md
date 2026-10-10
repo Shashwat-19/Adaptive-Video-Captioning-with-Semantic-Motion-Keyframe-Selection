@@ -7,6 +7,8 @@ This file is a plan only. No source, config, or notebook files were changed whil
 
 **Current state:** `pytest` passes (9/9). flake8 is not installed locally, so lint was not run. Items marked *(by reading)* were found by reading the code and have not been reproduced by running it.
 
+**Notebook review (2026-10-11):** the cell-by-cell review of `notebooks/video_captioning_research-4.ipynb` is tracked in `notebooks/TODO.md`. This file keeps the repository review below.
+
 ---
 
 ## P0: Bugs to fix first
@@ -83,6 +85,7 @@ This file is a plan only. No source, config, or notebook files were changed whil
   - Done: the four links now point to `video_captioning_research-4.ipynb`. If item 2.2 renames or regenerates the notebook, update them again.
 
 - [ ] **Notebook has drifted from its generator** *(blocked: your decision on the source of truth; several other items depend on it)*
+  - Status 2026-10-11 (uncommitted, not reviewed on its own): the builder was regenerated from the committed notebook's cells, so it now has 65 cells. It still writes `video_captioning_research.ipynb`, not the `-4` name; that filename is still your decision. Leave this item open until the sync is committed separately.
   - Where: `scripts/build_notebook.py` (27 section headings, 54 cells) vs `notebooks/video_captioning_research-4.ipynb` (31 headings, 65 cells).
   - Missing from the builder: sections `0b`, `1b`, `2b`, `17b`, a "Video-Caption Coverage Audit", and an "Interpreting runtime" subsection. Section numbering also differs.
   - Problem: re-running `build_notebook.py` would silently discard the manual edits. Also, `build_notebook.py:653` writes to the non-suffixed filename.
