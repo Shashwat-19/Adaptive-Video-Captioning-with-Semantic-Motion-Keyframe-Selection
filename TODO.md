@@ -169,10 +169,10 @@ This file is a plan only. No source, config, or notebook files were changed whil
 - [x] **Remove the tautological assertion**
   - Where: `tests/test_metrics.py:24`, `assert not math.isnan(float(len(METRIC_NAMES)))`. It always passes and tests nothing.
 
-- [ ] **Add tests for untested modules** *(partial: 7 of 9 done and reviewed; `motion_scores`/`semantic_scores` tests are drafted in `tests/test_keyframe_scores.py`, not committed, and one assertion needs a fix)*
+- [ ] **Add tests for untested modules** *(partial: 7 of 9 done and reviewed; `motion_scores`/`semantic_scores` tests are in `tests/test_keyframe_scores.py`; the identical-frames tolerance was loosened after a CI failure; the `semantic_scores` test skips without torch, so it has not run locally)*
   - [x] `select_frames_from_video` in `keyframes/pipeline.py`, including the two-video case from P0 (`tests/test_pipeline.py`, item 1.1).
   - [x] `minmax_normalize` (`tests/test_keyframe_selection.py`).
-  - [ ] `motion_scores`: needs OpenCV, not installed locally.
+  - [x] `motion_scores` (`tests/test_keyframe_scores.py`; passes with the pinned `opencv-python-headless` 4.10.0.84. Identical frames normalize to about 1.6e-4, not exactly 0, so the test uses `abs=1e-3`).
   - [ ] `semantic_scores`, using a stub processor and model: needs torch, not installed locally.
   - [x] `load_config`: three-level inheritance with child overrides, repo chain smoke test, unknown-field rejection (`tests/test_config.py`).
   - [x] `read_caption_table` for CSV, TSV, and JSON (`tests/test_dataset.py`; the TSV case has a comma on every line so only the explicit `.tsv` rule parses it).
