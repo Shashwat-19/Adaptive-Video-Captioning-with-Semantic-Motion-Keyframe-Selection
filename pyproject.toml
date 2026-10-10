@@ -29,7 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 finetuning = ["bitsandbytes==0.43.3 ; platform_system == 'Linux'"]
-analysis = ["seaborn==0.13.2", "evaluate==0.4.3", "wordcloud==1.9.3"]
+analysis = ["seaborn==0.13.2", "evaluate==0.4.3", "wordcloud==1.9.3", "pycocoevalcap==1.2"]
 dev = ["pytest==8.3.3"]
 
 [tool.setuptools.packages.find]
