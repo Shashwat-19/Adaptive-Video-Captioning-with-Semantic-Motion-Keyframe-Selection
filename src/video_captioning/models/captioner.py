@@ -77,7 +77,12 @@ class BLIP2VideoCaptioner:
         return self.processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
 
     def load_checkpoint(self, path: str | Path) -> "BLIP2VideoCaptioner":
-        """Load a locally saved BLIP-2 checkpoint directory."""
+        """Load a locally saved BLIP-2 checkpoint directory.
+
+        A LoRA epoch directory from ``run_finetuning`` holds only adapter weights and the processor.
+        With ``peft`` installed, ``from_pretrained`` reads its ``adapter_config.json``, loads the base
+        model named there, and attaches the adapter, so the base model must also be available.
+        """
         self.model_name = str(path)
         self.model = None
         self.processor = None
