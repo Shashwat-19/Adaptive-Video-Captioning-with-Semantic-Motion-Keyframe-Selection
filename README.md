@@ -1,107 +1,102 @@
 # Adaptive Video Captioning with Semantic-Motion Keyframe Selection
 
-Reduces the cost of video captioning on MSVD by selecting informative keyframes before running BLIP-2, instead of processing every frame.
-
-This repository centers on a Colab-ready research notebook:
-
-- [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb)
-
-It implements video-level splits, candidate frame extraction, motion and semantic scoring, adaptive semantic-motion fusion, temporal diversity filtering, BLIP-2 inference, T4-conscious fine-tuning, evaluation, ablations, and artifact saving.
-
-[![Notebook](https://img.shields.io/badge/notebook-Colab%20ready-blue)](./notebooks/video_captioning_research-4.ipynb)
-[![Python](https://img.shields.io/badge/python-3.10--3.12-blue)](#quickstart)
+[![Python](https://img.shields.io/badge/python-3.10--3.12-blue)](#getting-started)
 [![Dataset](https://img.shields.io/badge/dataset-MSVD-green)](#data)
-[![Hardware](https://img.shields.io/badge/hardware-T4%20friendly-orange)](#training)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](./LICENSE)
 
----
+Captioning a video with a vision-language model usually means processing many frames, which is expensive on modest hardware. This project selects a small set of informative keyframes first, then captions only those frames with BLIP-2. Frame selection combines motion cues, semantic novelty, and temporal diversity, and the project compares it against uniform and random sampling on the [MSVD](https://www.cs.utexas.edu/~ml/clamp/videoDescription/) corpus.
 
-## Table of Contents
+The main deliverable is a Colab-ready research notebook, [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb), which runs the full workflow. Reusable Python code and command-line scripts are provided for the same methods.
 
-- [Problem & Approach](#problem--approach)
-- [Architecture](#architecture)
-- [Results](#results)
-- [Quickstart](#quickstart)
-- [Project Structure](#project-structure)
+## Contents
+
+- [Method](#method)
+- [Status](#status)
+- [Repository layout](#repository-layout)
+- [Getting started](#getting-started)
 - [Data](#data)
-- [Training](#training)
+- [Usage](#usage)
 - [Evaluation](#evaluation)
-- [Inference / Serving](#inference--serving)
-- [Deployment](#deployment)
 - [Configuration](#configuration)
-- [Testing](#testing)
-- [Monitoring & Drift](#monitoring--drift)
-- [Known Limitations](#known-limitations)
-- [Roadmap](#roadmap)
+- [Testing and CI](#testing-and-ci)
+- [Known limitations](#known-limitations)
 - [Contributing](#contributing)
-- [Citation](#citation)
 - [License](#license)
+- [Author](#author)
 
----
-
-## Problem & Approach
-
-Video captioning models often become expensive when they process long clips frame by frame, especially on constrained hardware like a single NVIDIA T4 GPU. The project addresses this by selecting a small set of representative keyframes from each video and captioning those frames with a pretrained vision-language model.
-
-The core approach combines motion cues, semantic novelty, and temporal diversity so the selected frames cover what changes in the video without wasting compute on near-duplicates. The notebook compares uniform sampling, random sampling, motion-only selection, semantic-only selection, fused selection, and diversity filtering.
-
-Non-goals:
-
-- It does not attempt end-to-end dense video understanding.
-- It does not require multi-GPU training.
-- It does not depend on A100/H100-class hardware.
-- It does not hardcode a single MSVD directory layout.
-
-## Architecture
+## Method
 
 ```mermaid
 flowchart TD
-    A[MSVD videos + captions] --> B[Dataset verification]
-    B --> C[Split by unique video ID]
-    C --> D[Candidate frame extraction]
-    D --> E[Frame scoring]
-    E --> E1[Uniform sampling]
-    E --> E2[Random sampling]
-    E --> E3[Motion selection]
-    E --> E4[Semantic selection]
-    E --> E5[Semantic-motion fusion]
-    E --> E6[Temporal diversity filter]
-    E1 --> F[Selected-frame storyboard]
-    E2 --> F
-    E3 --> F
-    E4 --> F
-    E5 --> F
-    E6 --> F
-    F --> G[BLIP-2 caption generation]
-    G --> H[Evaluation and ablations]
-    H --> I[Saved artifacts]
+    A[MSVD videos + captions] --> B[Verify and split by unique video ID]
+    B --> C[Extract candidate frames]
+    C --> D[Score frames]
+    D --> D1[Motion: Farneback optical flow]
+    D --> D2[Semantic novelty: DINOv2 embeddings]
+    D1 --> E[Fuse: alpha x semantic + (1 - alpha) x motion]
+    D2 --> E
+    E --> F[Temporal diversity filter]
+    F --> G[Storyboard of K selected frames]
+    G --> H[BLIP-2 caption]
+    H --> I[Evaluate and save artifacts]
 ```
 
-| Component | Purpose |
-|---|---|
-| Notebook | Main research workflow and experiment runner |
-| OpenCV | Video metadata, frame extraction, motion features |
-| BLIP-2 | Vision-language caption generation |
-| LoRA / mixed precision | T4-friendly fine-tuning |
-| Pandas / NumPy | Split logic, scoring tables, result tables |
-| Matplotlib / Seaborn | EDA and result visualizations |
+The notebook compares six selection methods at a fixed frame budget: `uniform`, `random`, `motion`, `semantic`, `semantic_motion`, and `semantic_motion_diverse` (the proposed method). A selected set of frames is tiled into one contact sheet, so BLIP-2 makes one call per video.
 
-## Results
+Two design rules keep the comparison honest:
 
-The notebook is structured to produce comparable results across baselines and the proposed method, but the final metric values depend on the dataset path and on whether you run the optional training/evaluation cells.
+- **Split by video.** Train, validation, and test sets are disjoint on video ID.
+- **Tune on validation only.** The fusion weight alpha is chosen on the validation split, then frozen before a single test pass.
 
-Use the generated tables in `results/metrics/` and the consolidated outputs in `results/metrics.csv` and `results/final_results.csv` as the source of truth after execution.
+## Status
 
-| Metric | Baseline | This Model | Delta | Notes |
-|---|---:|---:|---:|---|
-| BLEU-1 | run notebook | run notebook | run notebook | reported per split/method |
-| BLEU-4 | run notebook | run notebook | run notebook | optional CIDEr if available |
-| METEOR | run notebook | run notebook | run notebook | caption similarity metric |
-| ROUGE-L | run notebook | run notebook | run notebook | sequence overlap metric |
-| CIDEr | run notebook | run notebook | run notebook | computed when dependency exists |
+- The pipeline, ablations, frame-budget study, and fine-tuning paths are implemented in the notebook.
+- **No results are committed yet.** The notebook produces the metric tables when it is run on the MSVD data. Numbers will be added to this README once a frozen test run exists.
+- The fine-tuned arms have not been scored on the test split yet. The fine-tuning code writes validation-selected checkpoints, and the test comparison is wired up to use them.
+- Open methodology and reproducibility items are tracked in [`notebooks/TODO.md`](./notebooks/TODO.md).
 
-## Quickstart
+## Repository layout
 
-For a local environment, install the package from the repository root:
+```text
+.
+├── notebooks/
+│   ├── video_captioning_research-4.ipynb   # main research workflow (Colab)
+│   └── TODO.md                             # notebook review items
+├── scripts/                                # command-line entry points
+│   ├── select_keyframes.py                 # select keyframes for one video
+│   ├── inference.py                        # caption one video (optionally a fine-tuned checkpoint)
+│   ├── train.py                            # LoRA fine-tuning
+│   ├── evaluate.py                         # score a generated-caption CSV
+│   └── build_notebook.py                   # regenerates the notebook from source cells
+├── src/video_captioning/                   # reusable library
+│   ├── data/                               # caption normalization, video indexing, splits
+│   ├── keyframes/                          # motion, semantic, and selection pipeline
+│   ├── models/                             # BLIP-2 captioner
+│   ├── training/                           # fine-tuning
+│   ├── evaluation/                         # BLEU, METEOR, ROUGE-L, CIDEr
+│   └── utils/                              # configuration and seeding
+├── configs/                                # YAML settings for the scripts
+├── tests/                                  # unit tests
+├── research/                               # methodology, data dictionary, experiment notes
+├── coursework/                             # separate course lab, not part of the research pipeline
+├── results/                                # tracked placeholder folders; generated outputs are git-ignored
+├── .github/workflows/                      # CI: lint and tests
+├── requirements.txt
+└── pyproject.toml
+```
+
+## Getting started
+
+### On Google Colab (recommended)
+
+1. Open [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb) in Colab with a GPU runtime (a T4 is enough).
+2. In Section 0, set the paths if you are not using the defaults (see [Configuration](#configuration)).
+3. Run the cells in order. The environment cell reports any packages that are missing.
+4. Keep the fine-tuning and ablation flags off until the smoke test passes.
+
+### Locally
+
+Requires Python 3.10–3.12 and a CUDA-capable PyTorch build for GPU work.
 
 ```bash
 python -m venv .venv
@@ -109,297 +104,129 @@ source .venv/bin/activate
 pip install -e ".[dev,analysis]"
 ```
 
-On Google Colab, clone the repository, change into it, and run the notebook's environment cell. Colab already provides PyTorch; install only any packages that the notebook reports as missing.
-
-1. Open [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb) in Google Colab.
-2. Set the dataset paths in Section 0.
-3. If needed, mount Google Drive in the optional drive cell.
-4. Run the environment, dataset verification, splitting, and preprocessing cells.
-5. Keep the heavier fine-tuning and ablation flags disabled until you are ready to run them.
-
-Minimal run sequence in the notebook:
-
-```text
-0. Research Configuration
-1. Environment and GPU Setup
-2. Dataset Loading and Verification
-3. Exploratory Data Analysis
-4. Dataset Splitting
-5. Video Preprocessing
-6. Candidate Frame Extraction
-...
-25. Conclusions and Research Interpretation
-```
-
-## Project Structure
-
-```text
-.
-├── README.md
-├── LICENSE                  # MIT
-├── .flake8                  # flake8 config used by CI lint
-├── .gitignore               # Keeps datasets, checkpoints, and generated outputs out of Git
-├── .github/workflows/       # CI: flake8, pytest, and import checks
-├── configs/                 # Reproducible baseline and training settings
-├── coursework/              # Separate course lab (Lab 8); not part of the research pipeline
-├── notebooks/               # Colab-first research workflow
-│   └── video_captioning_research-4.ipynb
-├── research/                # Methodology, experiment log, and READ-format.md (a generic README template)
-├── results/                 # Empty tracked artifact locations; outputs are ignored
-├── scripts/                 # CLI entry points and notebook generator
-├── src/video_captioning/    # Reusable data, keyframe, model, training, and metric code
-├── tests/                   # Deterministic unit tests
-├── pyproject.toml
-└── requirements.txt
-```
-
-The notebook writes outputs into its configured `OUTPUT_DIR`. The reusable scripts write to the `output_dir` specified in YAML, typically under:
-
-```text
-results/
-checkpoints/
-configs/
-cache/
-```
+Install the matching CUDA build of PyTorch first if your machine needs one. `requirements.txt` lists the pinned versions.
 
 ## Data
 
-The workflow is built around the MSVD (Microsoft Research Video Description) dataset corpus.
+The project uses the [MSVD (Microsoft Research Video Description) corpus](https://www.cs.utexas.edu/~ml/clamp/videoDescription/).
 
-### Dataset Acquisition (Kaggle)
+**Videos.** The notebook downloads the official video archive (`YouTubeClips.tar`, about 1.7 GiB) when it is not already present. It checks the MD5 checksum and then extracts and verifies all 1,970 clips. Downloads resume if interrupted.
 
-The MSVD dataset can be obtained from Kaggle using the `kagglehub` package.
+**Captions.** The notebook reads the official annotation file, `MSR Video Description Corpus.csv`, from `<DATA_ROOT>/data/extracted/annotations/`. This file is **not downloaded automatically** yet; place it there yourself. Only English captions are used. The notebook keeps the 80,838 English caption rows that match an extracted video.
 
-- **Kaggle Dataset Identifier**: `vtrnanh/msvd-dataset-corpus`
-
-To download the dataset programmatically:
-
-```python
-import kagglehub
-
-path = kagglehub.dataset_download("vtrnanh/msvd-dataset-corpus")
-print("Path to dataset files:", path)
-```
-
-> **Important**: Do **NOT** commit the downloaded dataset, raw video files, or extracted frames into Git. The repository's `.gitignore` excludes `/data/`, `/datasets/`, and raw video formats (`*.avi`, `*.mp4`, etc.).
-
-### Dataset Layout & Configuration
-
-The supported caption schemas, ID rules, video matching, and split logic are described in [`research/data-dictionary.md`](./research/data-dictionary.md).
-
-Once downloaded, point the configuration at the dataset path. In the notebook, set `DATA_ROOT` in Section 0 (or the `MSVD_DATA_ROOT` environment variable). For the CLI scripts, set `data_root` in the YAML config; the scripts do not read environment variables. The expected directory structure is:
+The command-line scripts use a simpler layout set in YAML:
 
 ```text
-msvd/
-├── YouTubeClips/
-│   ├── video1.avi
-│   ├── video2.avi
-│   └── ...
-└── captions.csv
+data/msvd/
+├── YouTubeClips/        # video files
+└── captions.csv         # caption records (video_id, caption)
 ```
 
-- **Split strategy**: unique video ID (disjoint train, validation, and test sets), not caption-row randomization
-- **Supported caption schemas**: flexible CSV, TSV, and JSON parsing
-- **Dataset checks**: video count, caption count, missing file count, sample records
-- **Configured locations**: in the notebook, `DATA_ROOT` (or `MSVD_DATA_ROOT`), `VIDEO_DIR` (or `MSVD_VIDEO_DIR`), `CAPTION_FILE` (or `MSVD_CAPTION_FILE`), and `OUTPUT_DIR` (or the `OUTPUT_DIR` environment variable); in the YAML configs used by `scripts/`, `data_root`, `video_dir`, `caption_file`, and `output_dir`
+Do not commit datasets, raw videos, or extracted frames. The `.gitignore` excludes `/data/` and the common video formats.
 
+Caption schemas, video ID rules, and split logic are documented in [`research/data-dictionary.md`](./research/data-dictionary.md).
 
-Example caption records:
+## Usage
 
-| video_id | caption |
-|---|---|
-| `video1` | `a man is playing guitar on stage` |
-| `video1` | `the musician performs for the crowd` |
-| `video2` | `a dog runs across the grass` |
+### Notebook
 
-The notebook saves:
+The notebook is the reference implementation of the experiment. Its flags in Section 0 control what runs:
 
-- `train_video_ids.csv`
-- `val_video_ids.csv`
-- `test_video_ids.csv`
-- complete split metadata in `configs/split_metadata.json`
+| Flag | Default | Effect |
+|---|---|---|
+| `USE_LORA` | `True` | LoRA adapters for fine-tuning |
+| `USE_4BIT` | `False` | 4-bit loading (needs `bitsandbytes`) |
+| `RUN_FINETUNING` | `False` | fine-tune the two training arms |
+| `RUN_TEST_ABLATIONS` | `False` | run the test-set ablation |
+| `RUN_FRAME_BUDGET_STUDY` | `False` | run the frame-count study |
 
-## Training
-
-The notebook includes T4-conscious fine-tuning paths. Each fine-tuning arm (`uniform` and `semantic_motion_diverse`) keeps the epoch with the lowest validation loss and records it in `best_checkpoint.json`, written only after the run finishes. A run that is interrupted, or whose validation loss is not finite, leaves no pointer. `freeze_test_configuration` stores each arm's checkpoint path and a SHA-256 hash of its files with the frozen configuration. When `RUN_TEST_ABLATIONS` is on, `run_ablation` includes the fine-tuned arms only if the frozen configuration names checkpoints for them; it then scores them alongside the zero-shot methods on one paired set of test videos. It refuses to start if either arm is missing from the freeze, or if a frozen checkpoint is gone or its files changed. If the freeze was recorded before training, the ablation runs zero-shot only. The alpha sweep uses the zero-shot base model by default, so the frozen alpha is tuned on the base model; pass `checkpoint=` to `plot_alpha_sensitivity` to tune it on a fine-tuned checkpoint instead. Two limits are still open (see `notebooks/TODO.md`): the arms train with whatever `ALPHA` is set when Section 15 runs, which can differ from the frozen alpha, and the freeze check does not cover every generation setting (for example the prompt and `num_beams`). The fine-tuned arms' test captions have not been generated yet.
-
-- mixed precision where available
-- small batch sizes
-- gradient accumulation
-- optional LoRA
-- optional 4-bit loading when supported
-- explicit GPU memory cleanup
-
-The training sections are designed to be opt-in through configuration flags so that you can run a fast smoke test first and only enable longer experiments when needed.
-
-The equivalent command-line entry point uses the same implemented methodology:
+### Command line
 
 ```bash
+# Select keyframes for one video
+python scripts/select_keyframes.py --video path/to/video.avi --config configs/baseline.yaml
+
+# Caption one video (optionally with a local fine-tuned checkpoint)
+python scripts/inference.py --video path/to/video.avi --config configs/baseline.yaml
+
+# LoRA fine-tuning; downloads BLIP-2 and DINOv2 weights and needs a local MSVD copy
 python scripts/train.py --config configs/training.yaml
+
+# Score a generated-caption CSV with video_id and caption columns
+python scripts/evaluate.py --predictions outputs/generated_captions.csv --config configs/baseline.yaml
 ```
 
-It downloads the configured BLIP-2 and DINOv2 checkpoints and requires a valid local MSVD path, so it is intentionally not a lightweight smoke test.
+The scripts download model weights on first use.
 
 ## Evaluation
 
-The notebook supports automatic caption evaluation with:
+The evaluator reports BLEU-1 to BLEU-4, METEOR, ROUGE-L, and CIDEr. CIDEr is computed when `pycocoevalcap` is installed (it is in the `analysis` extra).
 
-- BLEU-1 to BLEU-4
-- METEOR
-- ROUGE-L
-- CIDEr when the dependency is available (`pycocoevalcap`, included in the `analysis` extra and `requirements.txt`)
+Metric caveats:
 
-Metric caveat: BLEU and METEOR split captions on whitespace with no lowercasing or PTB tokenization, and CIDEr receives the raw caption strings, so scores are not directly comparable to published coco-caption or MSVD results. CIDEr computes its IDF weights from the references of the set being scored, so compare CIDEr only between methods evaluated on the same video IDs.
-
-It also produces:
-
-- ablation tables
-- frame-budget studies
-- efficiency comparisons
-- qualitative examples
-- final summary tables
-
-To score a generated-caption CSV with `video_id` and `caption` columns:
-
-```bash
-python scripts/evaluate.py --predictions outputs/generated_captions.csv \
-  --config configs/baseline.yaml
-```
-
-METEOR needs the NLTK `wordnet` corpus. `evaluate_captions` downloads it on first use when it is missing; on a machine without internet access, run `python -m nltk.downloader wordnet` beforehand.
-
-## Inference / Serving
-
-This repository is not a serving project. The notebook is optimized for offline research inference and experiment comparison rather than a deployed API.
-
-For inference inside the notebook, the workflow:
-
-1. selects frames
-2. composes them for BLIP-2
-3. generates captions
-4. writes outputs to the artifact directories
-
-The same local-video workflow is available as a CLI (and downloads model weights on first use):
-
-```bash
-python scripts/select_keyframes.py --video path/to/video.avi
-python scripts/inference.py --video path/to/video.avi
-```
-
-## Deployment
-
-There is no production deployment target in this repository.
-
-The intended runtime is:
-
-- Google Colab
-- optionally Kaggle
-- optionally a local Python environment with GPU support
+- BLEU and METEOR split captions on whitespace, with no lowercasing or PTB tokenization. CIDEr receives the raw caption strings. Scores are therefore **not directly comparable** with published coco-caption or MSVD numbers.
+- CIDEr computes IDF weights from the references of the set being scored. Compare CIDEr only across methods scored on the same video IDs. The notebook enforces this with a shared paired-ID set.
+- METEOR needs the NLTK `wordnet` corpus. It downloads on first use. Offline, run `python -m nltk.downloader wordnet` beforehand.
 
 ## Configuration
 
-Baseline and training settings are stored in [`configs/`](./configs). The notebook retains an equivalent Section 0 configuration block for a self-contained Colab workflow.
+Settings live in [`configs/`](./configs):
 
-Key values (notebook Section 0 names; the YAML configs use the lowercase equivalents, such as `data_root`, except for the notebook-only `RUN_*` flags):
+- `baseline.yaml`: dataset paths, seed, frame budget, selection alpha, split ratios, and model name.
+- `training.yaml`: fine-tuning batch size, accumulation, learning rate, epochs, LoRA, and 4-bit loading. It inherits `baseline.yaml`.
 
-- `DATA_ROOT`
-- `VIDEO_DIR`
-- `CAPTION_FILE`
-- `OUTPUT_DIR`
-- `SEED`
-- `NUM_CANDIDATE_FRAMES`
-- `NUM_SELECTED_FRAMES`
-- `ALPHA`
-- `RUN_FINETUNING`
-- `RUN_TEST_ABLATIONS`
-- `RUN_FRAME_BUDGET_STUDY`
+Notebook Section 0 reads these environment variables, all optional:
 
-The notebook also prints:
+| Variable | Default |
+|---|---|
+| `MSVD_DATA_ROOT` | `/content/msvd` |
+| `MSVD_VIDEO_DIR` | `YouTubeClips` |
+| `MSVD_CAPTION_FILE` | `captions.csv` |
+| `OUTPUT_DIR` | `/content/video_captioning_outputs` |
 
-- GPU name
-- GPU memory
-- CUDA availability
-- PyTorch version
+The command-line scripts read YAML only and do not use these variables.
 
-## Testing
-
-The repository includes lightweight unit tests for caption normalization, video-level splitting, keyframe selection, evaluation-pair handling, and storyboard composition:
+## Testing and CI
 
 ```bash
 pytest
 ```
 
-The notebook additionally performs practical checks:
+The unit tests cover caption normalization, video-level splitting, keyframe selection and scoring, evaluation-pair handling, and the model wrapper. Some tests need `torch`, `cv2`, or `nltk` and are skipped when those are missing.
 
-- dataset existence and schema checks
-- GPU capability inspection
-- unique-video split verification
-- video readability and metadata extraction
-- artifact-path creation
+GitHub Actions runs flake8 and pytest on Python 3.10, 3.11, and 3.12 for every push and pull request to `main`.
 
-## Monitoring & Drift
+## Known limitations
 
-This is a research notebook, not an always-on service, so runtime monitoring is limited to saved logs and artifact outputs.
-
-Useful outputs include:
-
-- frame-selection score CSVs
-- generated caption tables
-- evaluation summaries
-- efficiency tables
-- qualitative result images
-
-If you extend this into a deployed system later, the most relevant drift signals would be changes in caption length, token distribution, video duration distribution, and the quality of selected keyframes.
-
-## Known Limitations
-
-- The notebook expects the user to point it at a valid MSVD layout.
-- The notebook's path defaults are Colab paths: `DATA_ROOT` defaults to `/content/msvd` and `OUTPUT_DIR` to `/content/video_captioning_outputs` (override with `MSVD_DATA_ROOT` and `OUTPUT_DIR`). The optional Drive cell mounts at `/content/drive`. The committed notebook also uses fixed `/content` paths that the variables do not change: Section 2 searches `/content` for the video archive, Section 2b searches fixed `/content/...` fallback locations, and Section 23 sets `OUT` to `/content/video_captioning_outputs` directly. Outside Colab, set the variables for Section 0 and edit those cells' paths, including the Section 23 `OUT` line.
-- Full fine-tuning can be slow on a T4 and is intentionally disabled by default.
-- CIDEr depends on optional evaluation packages.
-- The repository does not include the MSVD dataset itself.
-- There is no separate inference API or deployment service.
-
-## Roadmap
-
-- add a small end-to-end smoke test notebook
-- record a representative benchmark run with real metrics
+- **No committed results yet.** Metric values depend on running the notebook on MSVD.
+- **Fine-tuned test results are pending.** The fine-tuned arms are trained and their checkpoints are selected on validation loss, but they have not been evaluated on the test split.
+- **Split granularity.** The split is by clip ID. Clips cut from the same YouTube video can share scenes, so a near-duplicate could fall in a different split. A split by YouTube ID is planned (see `notebooks/TODO.md`).
+- **Metric tokenization** differs from published MSVD evaluation (see [Evaluation](#evaluation)).
+- **Package pins.** The notebook records the installed versions but does not yet enforce the pins in `requirements.txt`. The most recent recorded Colab run used newer versions of some packages.
+- **Hardcoded Colab paths** remain in parts of the notebook (archive search, fallback locations, and the Section 23 output path). Outside Colab, edit those cells.
+- **Annotation CSV** must be placed manually (see [Data](#data)).
+- **Scope.** This is a research codebase. It has no serving API or deployment target.
 
 ## Contributing
 
-If you extend the notebook, keep the following constraints intact:
+Changes should keep to these rules:
 
-- split by unique video ID
-- preserve the Colab/T4 memory budget
-- keep configuration centralized
-- save outputs in deterministic artifact locations
-- avoid hardcoding a single local path
+- split by unique video ID, never by caption row
+- keep choices made on validation data separate from test-set reporting
+- keep configuration in one place
+- write outputs to deterministic artifact paths
+- do not hardcode a local path
+
+Edit the notebook through `scripts/build_notebook.py`, then regenerate it. Do not hand-edit the `.ipynb`.
 
 ## License
 
-This project is distributed under the MIT License.  
-For detailed licensing information, please refer to the [LICENSE](./LICENSE) file included in this repository.
+This project is released under the [MIT License](./LICENSE).
 
-## Contact
-## Shashwat
+## Author
 
-**Machine Learning Engineer | Scalable AI Systems**
+**Shashwat**: machine learning engineer working on ML systems, computer vision, and NLP.
 
-🔹 **ML systems:** (CV, NLP) + data pipelines<br>
-🔹 **End-to-end:** training → deployment<br>
-🔹 **Backend & Cloud:** Python, Flask, Node.js, Docker, AWS<br>
-🔹 **Projects:** Traffic AI, Video Summarizer, AI Assistants<br>
-
----
-
-## Open Source | Tech Innovation  
-Building robust applications and leveraging cloud technologies for high-performance solutions.
-
----
-
-### Find me here:  
-[<img src="https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white" />](https://github.com/Shashwat-19)  [<img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" />](https://www.linkedin.com/in/shashwatk1956/)  [<img src="https://img.shields.io/badge/Email-D14836?style=for-the-badge&logo=gmail&logoColor=white" />](mailto:shashwat1956@gmail.com)  [<img src="https://img.shields.io/badge/Hashnode-2962FF?style=for-the-badge&logo=hashnode&logoColor=white" />](https://hashnode.com/@Shashwat56)
-[<img src="https://img.shields.io/badge/HackerRank-15%2B-2EC866?style=for-the-badge&logo=HackerRank&logoColor=white" />](https://www.hackerrank.com/profile/shashwat1956)
-
-> Feel free to connect for tech collaborations, open-source contributions, or brainstorming innovative solutions!
-
+- GitHub: [Shashwat-19](https://github.com/Shashwat-19)
+- LinkedIn: [shashwatk1956](https://www.linkedin.com/in/shashwatk1956/)
+- Email: shashwat1956@gmail.com

@@ -43,7 +43,7 @@ Use these as ground truth. If the diff changes one of them, check the change aga
   - `README.md` links `notebooks/video_captioning_research-4.ipynb` in 4 places. The builder still writes `notebooks/video_captioning_research.ipynb`, so running it would create a second notebook. The output filename is an open decision.
   - Later TODO items change the builder's cells, so the builder will diverge from the committed `.ipynb` until the notebook is regenerated. That divergence is expected; count cells by generating into a temp directory.
 - **Known risky patterns:** `scripts/build_notebook.py` uses `np.load(..., allow_pickle=False)`. There is no `pickle` module use, no `torch.load`, and no builtin `eval()`/`exec()`. Every `.eval()` is a model-mode call. Hardcoded Colab paths (`/content/...`) appear in the builder (search for `/content`), and in the committed notebook.
-- **Docs, not production code:** `research/` and `coursework/`. `research/READ-format.md` is a generic README template.
+- **Docs, not production code:** `research/` and `coursework/`.
 
 ## Review procedure
 
