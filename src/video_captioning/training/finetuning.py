@@ -77,7 +77,7 @@ def run_finetuning(
         def __getitem__(self, index: int):
             video_id = self.ids[index]
             selection, self.semantic_runtime = select_frames_from_video(
-                video_paths[video_id], config, self.semantic_runtime
+                video_paths[video_id], config, semantic_runtime=self.semantic_runtime
             )
             return video_id, make_contact_sheet(selection.frames, config.image_size), random.choice(references[video_id])
 
@@ -100,7 +100,7 @@ def run_finetuning(
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config.learning_rate)
     steps = math.ceil(len(train_loader) / config.gradient_accumulation_steps) * config.num_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, max(1, int(0.1 * steps)), max(1, steps))
-    scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
     history: list[dict] = []
     best_validation_loss, patience = float("inf"), 0
 
@@ -109,7 +109,7 @@ def run_finetuning(
         total_loss, started = 0.0, time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         for step, (_, batch) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)):
-            with torch.cuda.amp.autocast(enabled=device == "cuda"):
+            with torch.autocast("cuda", enabled=device == "cuda"):
                 loss = model(**batch).loss / config.gradient_accumulation_steps
             scaler.scale(loss).backward()
             if (step + 1) % config.gradient_accumulation_steps == 0 or step + 1 == len(train_loader):
@@ -125,7 +125,7 @@ def run_finetuning(
         validation_losses = []
         with torch.no_grad():
             for _, batch in validation_loader:
-                with torch.cuda.amp.autocast(enabled=device == "cuda"):
+                with torch.autocast("cuda", enabled=device == "cuda"):
                     validation_losses.append(model(**batch).loss.item())
         record = {
             "epoch": epoch,
