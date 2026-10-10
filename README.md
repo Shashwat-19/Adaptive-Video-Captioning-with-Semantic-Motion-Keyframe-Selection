@@ -33,7 +33,7 @@ flowchart TD
     C --> D[Score frames]
     D --> D1[Motion: Farneback optical flow]
     D --> D2[Semantic novelty: DINOv2 embeddings]
-    D1 --> E[Fuse: alpha x semantic + (1 - alpha) x motion]
+    D1 --> E["Fuse: alpha x semantic + (1 - alpha) x motion"]
     D2 --> E
     E --> F[Temporal diversity filter]
     F --> G[Storyboard of K selected frames]
