@@ -37,12 +37,12 @@ Use these as ground truth. If the diff changes one of them, check the change aga
   - `select_diverse_keyframes` applies greedy temporal NMS on timestamps in seconds (`min_temporal_distance`, default 0.5), then backfills by score up to `min(k, len(indices))`.
 - **Seeding:** `utils/seed.py:seed_everything` seeds Python `random`, NumPy, and torch, and sets cuDNN deterministic. Only `scripts/train.py` calls it. `training/finetuning.py` uses `random.choice` to pick a caption per sample and a `DataLoader(shuffle=True)` with no explicit `generator` or `worker_init_fn`, so it relies on the global torch seed.
 - **Outputs:** library code writes only under the config `output_dir` (`outputs/...`). For example, `finetuning.py` writes `<output_dir>/checkpoints/<method>/` and `<output_dir>/results/logs/`. The repo `results/` contains only `.gitkeep` files and must stay that way.
-- **Notebook (known drift):**
-  - `README.md` links `notebooks/video_captioning_research.ipynb` in 4 places, but that file does not exist. The committed notebook is `notebooks/video_captioning_research-4.ipynb`.
-  - `scripts/build_notebook.py` produces 54 cells and 27 `#` headings. The committed notebook has 65 cells and 31 headings, including `0b`, `1b`, `2b`, and `17b`.
-  - The committed notebook already contains fixes the builder lacks: `np.load(..., allow_pickle=False)` and `PeftModel` checkpoint loading.
-  - The builder writes to `notebooks/video_captioning_research.ipynb`. Running it would create a second notebook, not update the committed one.
-- **Known risky patterns:** `scripts/build_notebook.py:250` uses `np.load(cache, allow_pickle=True)`. There is no `pickle` module use, no `torch.load`, and no builtin `eval()`/`exec()`. Every `.eval()` is a model-mode call. Hardcoded Colab paths (`/content/...`) appear at `scripts/build_notebook.py:36`, `:39`, and `:85`, and in the committed notebook.
+- **Notebook (builder synced 2026-10-11):**
+  - `scripts/build_notebook.py` was regenerated from the committed notebook's cell sources (65 cells, same headings). Cells are raw strings, so regexes are preserved. Saved outputs and widget state are not produced by the builder.
+  - After the sync, the `notebooks/TODO.md` item "Fine-tuned models are trained but never evaluated" changed cells 33 (`load_checkpoint` reuse), 39 (best-epoch pointer, checkpoint hash), 45 (alpha sweep `checkpoint=`, frozen checkpoints) and 47 (fine-tuned arms in `run_ablation`). Every other cell matches `notebooks/video_captioning_research-4.ipynb` apart from trailing whitespace.
+  - `README.md` links `notebooks/video_captioning_research-4.ipynb` in 4 places. The builder still writes `notebooks/video_captioning_research.ipynb`, so running it would create a second notebook. The output filename is an open decision.
+  - Later TODO items change the builder's cells, so the builder will diverge from the committed `.ipynb` until the notebook is regenerated. That divergence is expected; count cells by generating into a temp directory.
+- **Known risky patterns:** `scripts/build_notebook.py` uses `np.load(..., allow_pickle=False)`. There is no `pickle` module use, no `torch.load`, and no builtin `eval()`/`exec()`. Every `.eval()` is a model-mode call. Hardcoded Colab paths (`/content/...`) appear in the builder (search for `/content`), and in the committed notebook.
 - **Docs, not production code:** `research/` and `coursework/`. `research/READ-format.md` is a generic README template.
 
 ## Review procedure
