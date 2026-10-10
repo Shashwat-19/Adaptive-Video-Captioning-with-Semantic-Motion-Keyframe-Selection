@@ -145,7 +145,7 @@ def normalize_captions(raw: pd.DataFrame) -> pd.DataFrame:
                             out[start_col].astype(str).str.strip() + "_" +
                             out[end_col].astype(str).str.strip())
     else:
-        out["video_id"] = out.video_id.astype(str).str.strip().str.replace(r"\.(avi|mp4|webm|mov)$", "", regex=True, case=False)
+        out["video_id"] = out.video_id.astype(str).str.strip().str.replace(r"\\.(avi|mp4|webm|mov|mkv)$", "", regex=True, case=False)
     out["caption"] = out.caption.astype(str).str.strip()
     return out[out.caption.ne("") & out.video_id.ne("")].reset_index(drop=True)
 
