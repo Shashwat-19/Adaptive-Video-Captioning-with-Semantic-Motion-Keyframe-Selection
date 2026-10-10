@@ -2,12 +2,19 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
+from video_captioning.keyframes.motion import minmax_normalize
 from video_captioning.keyframes.selector import (
     fused_scores,
     select_diverse_keyframes,
     select_keyframe_positions,
     uniform_selection,
 )
+
+
+def test_minmax_normalize_scales_to_unit_range_and_zeroes_constant_scores():
+    assert np.allclose(minmax_normalize([2.0, 4.0, 6.0]), [0.0, 0.5, 1.0])
+    assert np.array_equal(minmax_normalize([3.0, 3.0, 3.0]), np.zeros(3))
+    assert minmax_normalize([]).size == 0
 
 
 def test_uniform_selection_spans_candidate_timeline():
