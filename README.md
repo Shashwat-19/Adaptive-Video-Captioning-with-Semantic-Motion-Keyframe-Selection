@@ -4,11 +4,11 @@ Reduces the cost of video captioning on MSVD by selecting informative keyframes 
 
 This repository centers on a Colab-ready research notebook:
 
-- [`notebooks/video_captioning_research.ipynb`](./notebooks/video_captioning_research.ipynb)
+- [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb)
 
 It implements video-level splits, candidate frame extraction, motion and semantic scoring, adaptive semantic-motion fusion, temporal diversity filtering, BLIP-2 inference, T4-conscious fine-tuning, evaluation, ablations, and artifact saving.
 
-[![Notebook](https://img.shields.io/badge/notebook-Colab%20ready-blue)](./notebooks/video_captioning_research.ipynb)
+[![Notebook](https://img.shields.io/badge/notebook-Colab%20ready-blue)](./notebooks/video_captioning_research-4.ipynb)
 [![Python](https://img.shields.io/badge/python-3.10--3.12-blue)](#quickstart)
 [![Dataset](https://img.shields.io/badge/dataset-MSVD-green)](#data)
 [![Hardware](https://img.shields.io/badge/hardware-T4%20friendly-orange)](#training)
@@ -111,7 +111,7 @@ pip install -e ".[dev,analysis]"
 
 On Google Colab, clone the repository, change into it, and run the notebook's environment cell. Colab already provides PyTorch; install only any packages that the notebook reports as missing.
 
-1. Open [`notebooks/video_captioning_research.ipynb`](./notebooks/video_captioning_research.ipynb) in Google Colab.
+1. Open [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb) in Google Colab.
 2. Set the dataset paths in Section 0.
 3. If needed, mount Google Drive in the optional drive cell.
 4. Run the environment, dataset verification, splitting, and preprocessing cells.
@@ -136,10 +136,15 @@ Minimal run sequence in the notebook:
 ```text
 .
 ├── README.md
+├── LICENSE                  # MIT
+├── .flake8                  # flake8 config used by CI lint
+├── .gitignore               # Keeps datasets, checkpoints, and generated outputs out of Git
+├── .github/workflows/       # CI: flake8, pytest, and import checks
 ├── configs/                 # Reproducible baseline and training settings
+├── coursework/              # Separate course lab (Lab 8); not part of the research pipeline
 ├── notebooks/               # Colab-first research workflow
-│   └── video_captioning_research.ipynb
-├── research/                # Methodology, experiment log, original task/template
+│   └── video_captioning_research-4.ipynb
+├── research/                # Methodology, experiment log, and READ-format.md (a generic README template)
 ├── results/                 # Empty tracked artifact locations; outputs are ignored
 ├── scripts/                 # CLI entry points and notebook generator
 ├── src/video_captioning/    # Reusable data, keyframe, model, training, and metric code
@@ -180,7 +185,9 @@ print("Path to dataset files:", path)
 
 ### Dataset Layout & Configuration
 
-Once downloaded, set `DATA_ROOT` (or the `MSVD_DATA_ROOT` environment variable) to the downloaded dataset path. The expected directory structure is:
+The supported caption schemas, ID rules, video matching, and split logic are described in [`research/data-dictionary.md`](./research/data-dictionary.md).
+
+Once downloaded, point the configuration at the dataset path. In the notebook, set `DATA_ROOT` in Section 0 (or the `MSVD_DATA_ROOT` environment variable). For the CLI scripts, set `data_root` in the YAML config; the scripts do not read environment variables. The expected directory structure is:
 
 ```text
 msvd/
@@ -194,7 +201,7 @@ msvd/
 - **Split strategy**: unique video ID (disjoint train, validation, and test sets), not caption-row randomization
 - **Supported caption schemas**: flexible CSV, TSV, and JSON parsing
 - **Dataset checks**: video count, caption count, missing file count, sample records
-- **Configured locations**: `DATA_ROOT` (or `MSVD_DATA_ROOT`), `VIDEO_DIR` (or `MSVD_VIDEO_DIR`), `CAPTION_FILE` (or `MSVD_CAPTION_FILE`)
+- **Configured locations**: in the notebook, `DATA_ROOT` (or `MSVD_DATA_ROOT`), `VIDEO_DIR` (or `MSVD_VIDEO_DIR`), `CAPTION_FILE` (or `MSVD_CAPTION_FILE`), and `OUTPUT_DIR` (or the `OUTPUT_DIR` environment variable); in the YAML configs used by `scripts/`, `data_root`, `video_dir`, `caption_file`, and `output_dir`
 
 
 Example caption records:
@@ -240,7 +247,9 @@ The notebook supports automatic caption evaluation with:
 - BLEU-1 to BLEU-4
 - METEOR
 - ROUGE-L
-- CIDEr when the dependency is available
+- CIDEr when the dependency is available (`pycocoevalcap`, included in the `analysis` extra and `requirements.txt`)
+
+Metric caveat: BLEU and METEOR split captions on whitespace with no lowercasing or PTB tokenization, and CIDEr receives the raw caption strings, so scores are not directly comparable to published coco-caption or MSVD results. CIDEr computes its IDF weights from the references of the set being scored, so compare CIDEr only between methods evaluated on the same video IDs.
 
 It also produces:
 
@@ -256,6 +265,8 @@ To score a generated-caption CSV with `video_id` and `caption` columns:
 python scripts/evaluate.py --predictions outputs/generated_captions.csv \
   --config configs/baseline.yaml
 ```
+
+METEOR needs the NLTK `wordnet` corpus. `evaluate_captions` downloads it on first use when it is missing; on a machine without internet access, run `python -m nltk.downloader wordnet` beforehand.
 
 ## Inference / Serving
 
@@ -289,7 +300,7 @@ The intended runtime is:
 
 Baseline and training settings are stored in [`configs/`](./configs). The notebook retains an equivalent Section 0 configuration block for a self-contained Colab workflow.
 
-Key values:
+Key values (notebook Section 0 names; the YAML configs use the lowercase equivalents, such as `data_root`, except for the notebook-only `RUN_*` flags):
 
 - `DATA_ROOT`
 - `VIDEO_DIR`
@@ -325,7 +336,6 @@ The notebook additionally performs practical checks:
 - unique-video split verification
 - video readability and metadata extraction
 - artifact-path creation
-- syntax-safe notebook generation from `build_notebook.py`
 
 ## Monitoring & Drift
 
@@ -344,6 +354,7 @@ If you extend this into a deployed system later, the most relevant drift signals
 ## Known Limitations
 
 - The notebook expects the user to point it at a valid MSVD layout.
+- The notebook's path defaults are Colab paths: `DATA_ROOT` defaults to `/content/msvd` and `OUTPUT_DIR` to `/content/video_captioning_outputs` (override with `MSVD_DATA_ROOT` and `OUTPUT_DIR`). The optional Drive cell mounts at `/content/drive`. The committed notebook also uses fixed `/content` paths that the variables do not change: Section 2 searches `/content` for the video archive, Section 2b searches fixed `/content/...` fallback locations, and Section 23 sets `OUT` to `/content/video_captioning_outputs` directly. Outside Colab, set the variables for Section 0 and edit those cells' paths, including the Section 23 `OUT` line.
 - Full fine-tuning can be slow on a T4 and is intentionally disabled by default.
 - CIDEr depends on optional evaluation packages.
 - The repository does not include the MSVD dataset itself.
@@ -351,10 +362,8 @@ If you extend this into a deployed system later, the most relevant drift signals
 
 ## Roadmap
 
-- add a dedicated data dictionary for the MSVD schema variants
 - add a small end-to-end smoke test notebook
 - record a representative benchmark run with real metrics
-- add a license if you intend to publish the repository publicly
 
 ## Contributing
 

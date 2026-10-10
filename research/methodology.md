@@ -36,7 +36,7 @@ The repository includes an opt-in BLIP-2 fine-tuning path that follows the noteb
 
 ## Evaluation methodology
 
-The implemented evaluator calculates BLEU-1 through BLEU-4, METEOR, and ROUGE-L using each video's available reference captions. CIDEr is calculated only when the optional `pycocoevalcap` package is installed; otherwise it is recorded as unavailable. Alpha sensitivity is intended to be chosen on validation data before a single frozen-configuration test evaluation. No numerical results are currently committed.
+The implemented evaluator calculates BLEU-1 through BLEU-4, METEOR, and ROUGE-L using each video's available reference captions. CIDEr is calculated only when the optional `pycocoevalcap` package is installed (it is part of the `analysis` extra and `requirements.txt`); otherwise it is recorded as unavailable. BLEU and METEOR use whitespace tokens without lowercasing or PTB tokenization, and CIDEr receives the raw caption strings, so scores are not directly comparable to published coco-caption or MSVD numbers. CIDEr's IDF weights come from the references of the evaluated set, so CIDEr should only be compared across methods scored on the same video IDs. Alpha sensitivity is intended to be chosen on validation data before a single frozen-configuration test evaluation. No numerical results are currently committed.
 
 ## Limitations
 
@@ -48,4 +48,4 @@ The implemented evaluator calculates BLEU-1 through BLEU-4, METEOR, and ROUGE-L 
 
 ## Future work
 
-Planned work includes a data dictionary for MSVD variants, a representative fully logged experiment, a small smoke-test fixture, and qualitative error analysis. Native video encoders, a model registry, and a production serving layer are not implemented.
+The MSVD schema variants are documented in `research/data-dictionary.md`. Planned work includes a representative fully logged experiment, a small smoke-test fixture, and qualitative error analysis. Native video encoders, a model registry, and a production serving layer are not implemented.
