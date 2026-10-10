@@ -21,18 +21,36 @@ def evaluation_pairs(
     ]
 
 
+def ensure_nltk_data(resources: Iterable[str] = ("wordnet",)) -> None:
+    """Download the NLTK corpora that METEOR needs when they are missing, as the notebook does."""
+    import nltk
+
+    for resource in resources:
+        # nltk.download leaves wordnet zipped, and find() does not look inside the zip by this name.
+        for path in (f"corpora/{resource}", f"corpora/{resource}.zip"):
+            try:
+                nltk.data.find(path)
+                break
+            except LookupError:
+                continue
+        else:
+            nltk.download(resource, quiet=True)
+
+
 def evaluate_captions(
     predictions: Iterable[dict], references: dict[str, list[str]]
 ) -> dict[str, float]:
     """Calculate BLEU, METEOR, ROUGE-L, and optional CIDEr for caption predictions.
 
     ``predictions`` accepts dataframe records or ordinary dictionaries with ``video_id``
-    and ``caption`` keys. CIDEr remains ``NaN`` if ``pycocoevalcap`` is unavailable.
+    and ``caption`` keys. CIDEr remains ``NaN`` if ``pycocoevalcap`` is unavailable. The NLTK
+    ``wordnet`` corpus is downloaded on first use if it is missing.
     """
     pairs = evaluation_pairs(predictions, references)
     if not pairs:
         return {metric: float("nan") for metric in METRIC_NAMES}
 
+    ensure_nltk_data()
     from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
     from nltk.translate.meteor_score import meteor_score
     from rouge_score import rouge_scorer
