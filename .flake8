@@ -11,3 +11,14 @@ exclude =
     .ipynb_checkpoints
 max-line-length = 127
 max-complexity = 10
+# E203 conflicts with the conventional `items[start : stop]` slice spacing.
+extend-ignore = E203
+per-file-ignores =
+    # Scripts add src/ to sys.path before importing the package.
+    scripts/*.py: E402
+    # Tests call pytest.importorskip before importing optional-dependency modules.
+    tests/*.py: E402
+    # Notebook cells are embedded as string literals; reformatting them would change the generated notebook.
+    scripts/build_notebook.py: E122, E501
+    # Known: run_finetuning is too complex (15); refactor tracked in TODO.md.
+    src/video_captioning/training/finetuning.py: C901
