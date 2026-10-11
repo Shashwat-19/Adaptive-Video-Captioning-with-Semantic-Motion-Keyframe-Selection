@@ -1,0 +1,5 @@
+{"timestampMs":1791694290357,"processPid":96671,"stage":"process_spawn","outcome":"succeeded","elapsedMs":3,"failure":null}
+{"timestampMs":1791694290357,"processPid":96671,"event":"process_spawned","details":{"pid":96686}}
+{"timestampMs":1791694290361,"processPid":96671,"stage":"process_identity","outcome":"succeeded","elapsedMs":4,"failure":null}
+{"timestampMs":1791694290362,"processPid":96671,"stage":"pid_write","outcome":"succeeded","elapsedMs":0,"failure":null}
+{"timestampMs":1791694290362,"processPid":96671,"stage":"pid_publish","outcome":"succeeded","elapsedMs":0,"failure":null}
