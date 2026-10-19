@@ -6,7 +6,7 @@
 
 Captioning a video with a vision-language model usually means processing many frames, which is expensive on modest hardware. This project selects a small set of informative keyframes first, then captions only those frames with BLIP-2. Frame selection combines motion cues, semantic novelty, and temporal diversity, and the project compares it against uniform and random sampling on the [MSVD](https://www.cs.utexas.edu/~ml/clamp/videoDescription/) corpus.
 
-The main deliverable is a Colab-ready research notebook, [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb), which runs the full workflow. Reusable Python code and command-line scripts are provided for the same methods.
+The main deliverable is a Colab-ready research notebook, [`notebooks/video_captioning_research.ipynb`](./notebooks/video_captioning_research.ipynb), which runs the full workflow. Reusable Python code and command-line scripts are provided for the same methods.
 
 ## Contents
 
@@ -36,17 +36,17 @@ flowchart TD
     D1 --> E["Fuse: alpha x semantic + (1 - alpha) x motion"]
     D2 --> E
     E --> F[Temporal diversity filter]
-    F --> G[Storyboard of K selected frames]
-    G --> H[BLIP-2 caption]
+    F --> G[K selected frames]
+    G --> H[BLIP-2 caption per frame, then consensus]
     H --> I[Evaluate and save artifacts]
 ```
 
-The notebook compares six selection methods at a fixed frame budget: `uniform`, `random`, `motion`, `semantic`, `semantic_motion`, and `semantic_motion_diverse` (the proposed method). A selected set of frames is tiled into one contact sheet, so BLIP-2 makes one call per video.
+The notebook compares six selection methods at a fixed frame budget: `uniform`, `random`, `motion`, `semantic`, `semantic_motion`, and `semantic_motion_diverse` (the proposed method). Each selected frame is captioned at full resolution in one batched BLIP-2 call, and the video caption is the consensus of those per-frame captions.
 
 Two design rules keep the comparison honest:
 
 - **Split by video.** Train, validation, and test sets are disjoint on video ID.
-- **Tune on validation only.** The fusion weight alpha is chosen on the validation split, then frozen before a single test pass.
+- **Prespecified alpha.** The fusion weight alpha is fixed (default 0.5) before fine-tuning and shared by every arm. The validation alpha sweep is a sensitivity report only and never changes the test configuration.
 
 ## Status
 
@@ -60,7 +60,7 @@ Two design rules keep the comparison honest:
 ```text
 .
 ├── notebooks/
-│   ├── video_captioning_research-4.ipynb   # main research workflow (Colab)
+│   ├── video_captioning_research.ipynb     # main research workflow (Colab)
 │   └── TODO.md                             # notebook review items
 ├── scripts/                                # command-line entry points
 │   ├── select_keyframes.py                 # select keyframes for one video
@@ -89,7 +89,7 @@ Two design rules keep the comparison honest:
 
 ### On Google Colab (recommended)
 
-1. Open [`notebooks/video_captioning_research-4.ipynb`](./notebooks/video_captioning_research-4.ipynb) in Colab with a GPU runtime (a T4 is enough).
+1. Open [`notebooks/video_captioning_research.ipynb`](./notebooks/video_captioning_research.ipynb) in Colab with a GPU runtime (a T4 is enough).
 2. In Section 0, set the paths if you are not using the defaults (see [Configuration](#configuration)).
 3. Run the cells in order. The environment cell reports any packages that are missing.
 4. Keep the fine-tuning and ablation flags off until the smoke test passes.
@@ -164,7 +164,7 @@ The evaluator reports BLEU-1 to BLEU-4, METEOR, ROUGE-L, and CIDEr. CIDEr is com
 
 Metric caveats:
 
-- BLEU and METEOR split captions on whitespace, with no lowercasing or PTB tokenization. CIDEr receives the raw caption strings. Scores are therefore **not directly comparable** with published coco-caption or MSVD numbers.
+- Every metric scores captions and references after the internal protocol `lowercase_ascii_alphanumeric_v1` (lowercase, keep only ASCII letters and digits). ROUGE-L is unstemmed. This is **not PTB/coco-caption tokenization**, so scores are not directly comparable with published coco-caption or MSVD numbers.
 - CIDEr computes IDF weights from the references of the set being scored. Compare CIDEr only across methods scored on the same video IDs. The notebook enforces this with a shared paired-ID set.
 - METEOR needs the NLTK `wordnet` corpus. It downloads on first use. Offline, run `python -m nltk.downloader wordnet` beforehand.
 
@@ -201,9 +201,9 @@ GitHub Actions runs flake8 and pytest on Python 3.10, 3.11, and 3.12 for every p
 - **No committed results yet.** Metric values depend on running the notebook on MSVD.
 - **Fine-tuned test results are pending.** The fine-tuned arms are trained and their checkpoints are selected on validation loss, but they have not been evaluated on the test split.
 - **Split granularity.** The split is by clip ID. Clips cut from the same YouTube video can share scenes, so a near-duplicate could fall in a different split. A split by YouTube ID is planned (see `notebooks/TODO.md`).
-- **Metric tokenization** differs from published MSVD evaluation (see [Evaluation](#evaluation)).
+- **Metric tokenization** (`lowercase_ascii_alphanumeric_v1`) differs from published MSVD evaluation (see [Evaluation](#evaluation)).
 - **Package pins.** The notebook records the installed versions but does not yet enforce the pins in `requirements.txt`. The most recent recorded Colab run used newer versions of some packages.
-- **Hardcoded Colab paths** remain in parts of the notebook (archive search, fallback locations, and the Section 23 output path). Outside Colab, edit those cells.
+- **Colab defaults.** Section 0 defaults to `/content/...` paths and the archive search also checks `/content`. Outside Colab, set the environment variables in [Configuration](#configuration).
 - **Annotation CSV** must be placed manually (see [Data](#data)).
 - **Scope.** This is a research codebase. It has no serving API or deployment target.
 
