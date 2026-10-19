@@ -44,4 +44,5 @@ def semantic_scores(
     novelty = np.zeros(len(embedding_array))
     if len(embedding_array) > 1:
         novelty[1:] = 1 - (embedding_array[1:] * embedding_array[:-1]).sum(axis=1)
+        novelty[0] = novelty[1]  # frame 0 has no predecessor; reuse the first interval so it is not always the minimum
     return minmax_normalize(novelty), embedding_array

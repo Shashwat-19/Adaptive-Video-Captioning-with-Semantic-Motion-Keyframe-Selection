@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,7 +36,8 @@ def select_frames_from_video(
     """
     method = method or config.keyframe_method
     frames, indices, timestamps = extract_candidate_frames(video_path, config.num_candidate_frames)
-    kwargs = {"seed": config.seed}
+    # Per-video seed so the random baseline differs across videos but stays reproducible.
+    kwargs = {"seed": config.seed + zlib.crc32(Path(video_path).stem.encode())}
     if method not in {"uniform", "random"}:
         if semantic_runtime is None:
             semantic_runtime = load_semantic_encoder()

@@ -63,12 +63,12 @@ def select_diverse_keyframes(
     if k < 1 or not indices:
         return [], [], []
     chosen_positions: list[int] = []
-    for position in np.argsort(scores)[::-1]:
+    for position in np.argsort(scores, kind="stable")[::-1]:
         if all(abs(timestamps[position] - timestamps[chosen]) >= min_temporal_distance for chosen in chosen_positions):
             chosen_positions.append(int(position))
         if len(chosen_positions) == min(k, len(indices)):
             break
-    for position in np.argsort(scores)[::-1]:
+    for position in np.argsort(scores, kind="stable")[::-1]:
         if len(chosen_positions) == min(k, len(indices)):
             break
         if int(position) not in chosen_positions:
@@ -115,4 +115,4 @@ def select_keyframe_positions(
             indices, scores, timestamps, k, min_temporal_distance
         )
         return [indices.index(frame) for frame in selected]
-    return sorted(np.argsort(scores)[::-1][: min(k, len(indices))].tolist())
+    return sorted(np.argsort(scores, kind="stable")[::-1][: min(k, len(indices))].tolist())

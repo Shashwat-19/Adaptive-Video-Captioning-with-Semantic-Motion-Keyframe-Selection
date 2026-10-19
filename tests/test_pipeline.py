@@ -47,3 +47,12 @@ def test_finetuning_passes_semantic_runtime_by_keyword():
     for call in calls:
         assert len(call.args) <= 2, "the third positional parameter is `method`, not the semantic runtime"
         assert "semantic_runtime" in {keyword.arg for keyword in call.keywords}
+
+
+def test_random_baseline_varies_by_video_and_repeats_per_video(stubbed_pipeline):
+    config = ExperimentConfig(num_selected_frames=2, keyframe_method="random")
+    names = [f"video_{i}" for i in range(6)]
+    picks = {name: pipeline.select_frames_from_video(name, config)[0].frame_indices for name in names}
+
+    assert len({tuple(p) for p in picks.values()}) > 1
+    assert pipeline.select_frames_from_video("video_0", config)[0].frame_indices == picks["video_0"]
