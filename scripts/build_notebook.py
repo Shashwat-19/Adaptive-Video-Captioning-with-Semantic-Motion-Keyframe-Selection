@@ -1515,7 +1515,7 @@ def generate_for_ids(video_ids, method, alpha=None, checkpoint=None, run_tag="ma
     video_ids=sorted(set(video_ids))
     if not video_ids: raise ValueError("No videos requested")
     if set(video_ids) & splits["test"]:
-        record=assert_test_configuration_frozen(allow_budget_override=budget_override)
+        record=assert_test_configuration_frozen(allow_budget_override=budget_override)  # defined in section 17b; run that cell before any test call
         if checkpoint:
             matching=[x for x in record["finetuned_checkpoints"].values() if x and x["path"]==str(checkpoint)]
             if not matching: raise RuntimeError("Test checkpoint was not frozen")
@@ -1527,12 +1527,12 @@ def generate_for_ids(video_ids, method, alpha=None, checkpoint=None, run_tag="ma
     if checkpoint: captioner.load_checkpoint(checkpoint)
     else: captioner.load_model()
     if method in {"semantic","semantic_motion","semantic_motion_diverse"}: load_semantic_encoder()  # model load is not selection time
+    if alpha is not None and not 0<=alpha<=1: raise ValueError("alpha must be in [0, 1]")
     output=[]
     for vid in tqdm(list(video_ids),desc=f"Generate {method}"):
         try:
             candidates=cached_candidates(vid)  # decode or cache load stays untimed so the first method does not pay for the cache
             a=CFG.ALPHA if alpha is None else alpha
-            if not 0<=a<=1: raise ValueError("alpha must be in [0, 1]")
             begin=time.perf_counter()  # inference_time_s = frame selection + captioning
             frames,indices,_,_=select_from_candidates(*candidates,method,CFG.NUM_SELECTED_FRAMES,a,seed=video_seed(vid))
             pred=captioner.generate_caption(frames)
@@ -1645,9 +1645,11 @@ def plot_alpha_sensitivity(validation_ids, alphas=(0,.25,.5,.75,1.0), checkpoint
     for alpha,preds in predictions.items():
         paired=preds[preds.video_id.isin(paired_ids)]
         rows.append({"alpha":alpha,"Requested Videos":len(validation_ids),
-                     "Successful Videos":int(preds.caption.notna().sum()),"Paired Videos":len(paired_ids),
+                     "Successful Videos":int((preds.caption.notna() & preds.caption.map(normalize_metric_caption).ne("")).sum()),"Paired Videos":len(paired_ids),
                      **evaluate_captions(paired,refs)})
     df=pd.DataFrame(rows); df.to_csv(OUT/f"results/metrics/alpha_validation{suffix}.csv",index=False)
+    # Record the alpha in force, so a later change to ALPHA after seeing this sweep is caught when the configuration is frozen.
+    (OUT/f"results/metrics/alpha_validation{suffix}_config.json").write_text(json.dumps({"config_alpha":CFG.ALPHA}))
     df.attrs["source_csv"]=f"results/metrics/alpha_validation{suffix}.csv"; df.attrs["checkpoint"]=str(checkpoint) if checkpoint else None
     for metric in ["CIDEr","BLEU-4"]:
         if df[metric].notna().any():
@@ -1681,6 +1683,9 @@ def freeze_test_configuration(validation_results=None):
     if (OUT/"configs/frozen_test_config.json").exists():
         raise RuntimeError("Configuration is already frozen. Use a new OUTPUT_DIR for a new experiment.")
     chosen=CFG.ALPHA; metric="prespecified"
+    for marker in sorted((OUT/"results/metrics").glob("alpha_validation*_config.json")):
+        if json.loads(marker.read_text())["config_alpha"] != CFG.ALPHA:
+            raise RuntimeError(f"ALPHA was changed after the validation sweep ({marker.name}); alpha must be prespecified. Use a new OUTPUT_DIR.")
     # Fine-tuned checkpoints (best validation-loss epoch per arm) are frozen with the config, path and file hash;
     # None if the arm has not been trained yet.
     checkpoints={}
@@ -1794,7 +1799,7 @@ def run_ablation(ids, methods=METHODS, include_finetuned=False):
         paired=preds[preds.video_id.isin(paired_ids)]
         metric=evaluate_captions(paired,test_references)
         rows.append({"Method":name,"Frames":CFG.NUM_SELECTED_FRAMES,"Requested Videos":len(ids),
-                     "Successful Videos":int(preds.caption.notna().sum()),"Paired Videos":len(paired_ids),
+                     "Successful Videos":int((preds.caption.notna() & preds.caption.map(normalize_metric_caption).ne("")).sum()),"Paired Videos":len(paired_ids),
                      **metric,"Inference Time":paired.inference_time_s.mean(),
                      "GPU Memory":paired.gpu_memory_gb.max(),"Checkpoint":sources[name],"Selection Alpha":float(preds.alpha.iloc[0]),"Evaluation Set":"ablation_paired"})
     table=pd.DataFrame(rows)
@@ -1845,7 +1850,7 @@ def frame_budget_study(ids, budgets=None):
         paired=preds[preds.video_id.isin(paired_ids)]
         metrics=evaluate_captions(paired,test_references)
         records.append({"Method":method,"Frames":k,"Requested Videos":len(ids),
-                        "Successful Videos":int(preds.caption.notna().sum()),"Paired Videos":len(paired_ids),
+                        "Successful Videos":int((preds.caption.notna() & preds.caption.map(normalize_metric_caption).ne("")).sum()),"Paired Videos":len(paired_ids),
                         **metrics,"Inference Time":paired.inference_time_s.mean(),
                         "GPU Memory":paired.gpu_memory_gb.max(),"Evaluation Set":"budget_paired"})
     df=pd.DataFrame(records); df.to_csv(OUT/"results/metrics/frame_budget.csv",index=False)
