@@ -82,7 +82,8 @@ def run_finetuning(
             )
             # Inference captions each selected frame, so train on one: random per epoch, the middle frame for validation.
             frame = random.choice(selection.frames) if self.training else selection.frames[len(selection.frames) // 2]
-            return video_id, frame.convert("RGB"), random.choice(references[video_id]) if self.training else references[video_id][0]
+            caption = random.choice(references[video_id]) if self.training else references[video_id][0]
+            return video_id, frame.convert("RGB"), caption
 
     def collate(batch):
         video_ids, images, texts = zip(*batch)

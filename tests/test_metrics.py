@@ -79,7 +79,8 @@ def test_evaluate_captions_end_to_end_on_a_fixed_input():
     scores = evaluate_captions(predictions, references)
 
     # Expected values from the pinned nltk 3.9.1, rouge-score 0.1.2 and pycocoevalcap 1.2.
-    # BLEU-2 = sqrt(4/4 unigram x 3/5 bigram precision); ROUGE-L is unstemmed: per-pair best F is 0.75 and 4/7, so the mean is 37/56.
+    # BLEU-2 = sqrt(4/4 unigram x 3/5 bigram precision).
+    # ROUGE-L is unstemmed: per-pair best F is 0.75 and 4/7, so the mean is 37/56.
     expected = {
         "BLEU-1": 1.0,
         "BLEU-2": 0.7745966692414834,
