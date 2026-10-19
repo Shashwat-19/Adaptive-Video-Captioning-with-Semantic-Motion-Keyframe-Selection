@@ -79,17 +79,40 @@ def test_evaluate_captions_end_to_end_on_a_fixed_input():
     scores = evaluate_captions(predictions, references)
 
     # Expected values from the pinned nltk 3.9.1, rouge-score 0.1.2 and pycocoevalcap 1.2.
-    # BLEU-2 = sqrt(4/4 unigram x 3/5 bigram precision); ROUGE-L stems "running"/"runs" to the same token.
+    # BLEU-2 = sqrt(4/4 unigram x 3/5 bigram precision); ROUGE-L is unstemmed: per-pair best F is 0.75 and 4/7, so the mean is 37/56.
     expected = {
         "BLEU-1": 1.0,
         "BLEU-2": 0.7745966692414834,
         "BLEU-3": 0.2714417616594907,
         "BLEU-4": 0.1778279410038923,
         "METEOR": 0.7398217075636431,
-        "ROUGE-L": 0.8571428571428571,
+        "ROUGE-L": 0.6607142857142857,
     }
     assert {name: scores[name] for name in expected} == pytest.approx(expected, rel=1e-9)
     if importlib.util.find_spec("pycocoevalcap") is None:
         assert math.isnan(scores["CIDEr"])
     else:
         assert scores["CIDEr"] == pytest.approx(1.8956396746556945, rel=1e-9)
+
+
+def test_metric_protocol_ignores_case_and_punctuation():
+    pytest.importorskip("nltk")
+    pytest.importorskip("rouge_score")
+    plain = evaluate_captions([{"video_id": "a", "caption": "a man runs"}], {"a": ["a man runs"]})
+    noisy = evaluate_captions([{"video_id": "a", "caption": "A MAN, runs!"}], {"a": ["a man runs."]})
+
+    names = [name for name in METRIC_NAMES if name != "CIDEr"]
+    assert {name: noisy[name] for name in names} == pytest.approx({name: plain[name] for name in names})
+
+
+def test_rouge_l_is_unstemmed():
+    pytest.importorskip("nltk")
+    pytest.importorskip("rouge_score")
+
+    assert evaluate_captions([{"video_id": "a", "caption": "runs"}], {"a": ["running"]})["ROUGE-L"] == 0.0
+
+
+def test_punctuation_only_caption_is_excluded():
+    scores = evaluate_captions([{"video_id": "a", "caption": "!!!"}], {"a": ["a dog"]})
+
+    assert all(math.isnan(value) for value in scores.values())
