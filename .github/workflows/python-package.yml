@@ -52,4 +52,4 @@ jobs:
           python -c "import video_captioning"
           python -c "from video_captioning.data.dataset import normalize_captions, split_by_video_id"
           python -c "from video_captioning.data.preprocessing import extract_candidate_frames"
-          python -c "from video_captioning.models.captioner import make_contact_sheet"
+          python -c "from video_captioning.models.captioner import consensus_caption"

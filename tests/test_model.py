@@ -2,7 +2,7 @@ import pytest
 
 PIL = pytest.importorskip("PIL.Image")
 
-from video_captioning.models.captioner import BLIP2VideoCaptioner, make_contact_sheet
+from video_captioning.models.captioner import BLIP2VideoCaptioner, consensus_caption
 
 
 def test_load_checkpoint_reloads_model_and_processor_from_the_checkpoint_directory(monkeypatch, tmp_path):
@@ -23,10 +23,38 @@ def test_load_checkpoint_reloads_model_and_processor_from_the_checkpoint_directo
     assert (captioner.model, captioner.processor) == ("model", "processor")
 
 
-def test_contact_sheet_preserves_the_storyboard_grid_shape():
-    frames = [PIL.new("RGB", (4, 4), color="red") for _ in range(3)]
+def test_consensus_caption_picks_the_caption_the_others_agree_with():
+    assert consensus_caption(["a man cooking", "a man is cooking food", "a collage of images"]) == "a man cooking"
 
-    sheet = make_contact_sheet(frames, image_size=10)
 
-    assert sheet.mode == "RGB"
-    assert sheet.size == (20, 20)
+def test_consensus_caption_rejects_all_empty_captions():
+    with pytest.raises(RuntimeError):
+        consensus_caption(["", "  "])
+
+
+def test_generate_caption_captions_every_frame_and_returns_the_consensus():
+    pytest.importorskip("torch")
+    seen = {}
+
+    class Inputs(dict):
+        def to(self, device, dtype):
+            return self
+
+    class Processor:
+        def __call__(self, images, return_tensors, **kwargs):
+            seen["images"], seen["kwargs"] = images, kwargs
+            return Inputs(pixel_values=len(images))
+
+        def batch_decode(self, tokens, skip_special_tokens):
+            return ["a man cooking", "a man is cooking food", "a collage of images"]
+
+    class Model:
+        def generate(self, **kwargs):
+            return "tokens"
+
+    captioner = BLIP2VideoCaptioner(device="cpu")
+    captioner.processor, captioner.model = Processor(), Model()
+
+    assert captioner.generate_caption([PIL.new("RGB", (4, 4)) for _ in range(3)]) == "a man cooking"
+    assert len(seen["images"]) == 3
+    assert seen["kwargs"] == {}  # no prompt, matching fine-tuning

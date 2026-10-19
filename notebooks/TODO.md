@@ -1,11 +1,11 @@
-# TODO: `video_captioning_research-4.ipynb`
+# TODO: `video_captioning_research.ipynb`
 
-Scope: `notebooks/video_captioning_research-4.ipynb`, all 65 cells, including saved outputs.
+Scope: the items below were written on 2026-10-11 against the old 65-cell `video_captioning_research-4.ipynb` with saved outputs, so their cell numbers do not apply to the current generated notebook (`notebooks/video_captioning_research.ipynb`, 63 cells, no saved outputs). Re-triage each item against `scripts/build_notebook.py` before ticking it; the 2026-10-19 import appears to resolve several (YouTube-grouped split, metric normalization, prompt, alpha, contact sheet) but none has been verified by a run.
 Date: 2026-10-11. Written from reading the committed notebook. Nothing was run.
 
-**How to apply fixes:** `CLAUDE.md` forbids hand-editing generated notebooks. Make each fix in `scripts/build_notebook.py`, regenerate the notebook, then check the cell diff. The builder was synced to the committed notebook's cells; since then, only the work on the first P0 item changes it (cells 33, 39, 45, 47). The builder still writes `notebooks/video_captioning_research.ipynb`, not the `-4` name, so do not regenerate into `notebooks/` until that filename is decided. Check changes by generating into a temp directory.
+**How to apply fixes:** `CLAUDE.md` forbids hand-editing generated notebooks. Make each fix in `scripts/build_notebook.py`, then regenerate (`python scripts/build_notebook.py` writes `notebooks/video_captioning_research.ipynb`) and check the cell diff. The builder was imported from `video_captioning_research_4_reviewed-2.ipynb` on 2026-10-19; later fixes (for example the report-only alpha sweep in Section 17b) make its cells differ from that file.
 
-**Labels:** *(by reading)* comes from the code and saved outputs. *(verify)* needs a run on a fresh runtime or the real MSVD CSV.
+**Labels:** *(by reading)* comes from the code and saved outputs. *(verify)* needs a run on a fresh runtime or the real MSVD annotation file.
 
 ---
 

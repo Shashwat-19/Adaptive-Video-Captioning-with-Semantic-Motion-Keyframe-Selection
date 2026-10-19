@@ -1,6 +1,6 @@
 # MSVD Data Dictionary
 
-How caption tables and video files are read, normalized, matched, and split. The library path (`src/video_captioning/data/dataset.py`, used by `scripts/`) and the committed notebook normalize the official corpus in nearly the same way and read it with the same encoding; the remaining differences are described below.
+How caption tables and video files are read, normalized, matched, and split by the library (`src/video_captioning/data/dataset.py`, used by `scripts/`). The notebook now reads `AllVideoDescriptions.txt` with its own parser and splits by source video, so the caption-format sections below that mention the notebook describe its earlier CSV-based version.
 
 ## Caption table formats
 
@@ -65,6 +65,7 @@ This is tracked in `TODO.md` ("`read_caption_table` does not handle a UTF-8 BOM 
 - Splits are made over unique `video_id`s, sorted first, never over caption rows, so every caption of a video lands in the same split.
 - Two `sklearn.model_selection.train_test_split` calls with `random_state=seed` give train, validation, and test sets. Defaults: 0.8 / 0.1 / 0.1, seed 42, the same values as `configs/baseline.yaml`.
 - The ratios must sum to 1, and at least three unique videos are required.
+- The notebook does not call this function. It shuffles sorted source YouTube IDs with `np.random.default_rng(seed)`, applies the ratios to source groups, expands them to clips, and records `protocol: source_video_grouped_v1`, `clip_ids`, `source_ids` and `configs/clip_source_mapping.csv`. Notebook and library splits are therefore not the same sets.
 - The library and `scripts/train.py` do not save split IDs. The notebook writes `train_video_ids.csv`, `val_video_ids.csv`, `test_video_ids.csv`, and `configs/split_metadata.json` under its output directory.
 
 ## Example

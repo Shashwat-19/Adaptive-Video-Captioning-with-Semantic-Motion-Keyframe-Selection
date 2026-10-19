@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 import numpy as np
 
 
 METRIC_NAMES = ("BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr")
+
+
+def normalize_metric_caption(text: str) -> str:
+    """Protocol lowercase_ascii_alphanumeric_v1: lowercase, keep [a-z0-9] runs, join with single spaces."""
+    return " ".join(re.findall(r"[a-z0-9]+", str(text).lower()))
 
 
 def evaluation_pairs(
@@ -42,11 +48,17 @@ def evaluate_captions(
 ) -> dict[str, float]:
     """Calculate BLEU, METEOR, ROUGE-L, and optional CIDEr for caption predictions.
 
+    Captions and references are first normalized by ``normalize_metric_caption`` (the notebook's
+    internal protocol, not PTB/coco-caption tokenization); ROUGE-L is unstemmed.
     ``predictions`` accepts dataframe records or ordinary dictionaries with ``video_id``
     and ``caption`` keys. CIDEr remains ``NaN`` if ``pycocoevalcap`` is unavailable. The NLTK
     ``wordnet`` corpus is downloaded on first use if it is missing.
     """
-    pairs = evaluation_pairs(predictions, references)
+    pairs = [
+        (normalize_metric_caption(caption), [normalize_metric_caption(ref) for ref in refs])
+        for caption, refs in evaluation_pairs(predictions, references)
+    ]
+    pairs = [(caption, refs) for caption, refs in pairs if caption]
     if not pairs:
         return {metric: float("nan") for metric in METRIC_NAMES}
 
@@ -72,7 +84,7 @@ def evaluate_captions(
             [meteor_score([reference.split() for reference in refs], caption.split()) for caption, refs in pairs]
         )
     )
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
     scores["ROUGE-L"] = float(
         np.mean(
             [

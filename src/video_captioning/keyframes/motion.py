@@ -29,4 +29,6 @@ def motion_scores(frames: list) -> np.ndarray:
             previous, current, None, 0.5, 3, 15, 3, 5, 1.2, 0
         )
         scores.append(float(np.linalg.norm(flow, axis=2).mean()))
+    if len(scores) > 1:
+        scores[0] = scores[1]  # frame 0 has no predecessor; reuse the first interval so it is not always the minimum
     return minmax_normalize(scores)
