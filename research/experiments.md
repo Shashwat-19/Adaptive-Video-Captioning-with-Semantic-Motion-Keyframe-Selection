@@ -8,7 +8,7 @@ Record each completed run here or in a linked, versioned result artifact. Do not
 |---|---|
 | Date | Not yet run |
 | Dataset | MSVD (user-provided, not committed) |
-| Dataset split | Video-level 80/10/10 split; seed 42 |
+| Dataset split | Notebook: 80/10/10 grouped by source YouTube ID (`source_video_grouped_v1`), seed 42; library: clip-level 80/10/10, seed 42 |
 | Configuration | `configs/baseline.yaml` |
 | Caption model | `Salesforce/blip2-opt-2.7b` |
 | Keyframe strategy | Uniform sampling baseline |
@@ -25,12 +25,12 @@ Record each completed run here or in a linked, versioned result artifact. Do not
 |---|---|
 | Date | Not yet run |
 | Dataset | MSVD (user-provided, not committed) |
-| Dataset split | Video-level split; test set held until configuration is frozen |
+| Dataset split | Source-video-grouped split (notebook); test set held until configuration is frozen |
 | Configuration | `configs/baseline.yaml` or a recorded derivative |
 | Caption model | `Salesforce/blip2-opt-2.7b` |
 | Keyframe strategy | `semantic_motion_diverse` |
 | Candidate / selected frames | 30 / 8 by default |
-| Semantic weight | `alpha: 0.5` by default; tune on validation only |
+| Semantic weight | `alpha: 0.5`, prespecified and shared by every arm; the validation sweep is a sensitivity report only |
 | Learning rate / batch size / epochs | Not yet measured or not applicable |
 | Training loss / validation loss | Not yet measured |
 | BLEU / METEOR / ROUGE-L / CIDEr | Not yet measured |

@@ -45,7 +45,7 @@ The notebook compares six selection methods at a fixed frame budget: `uniform`, 
 
 Two design rules keep the comparison honest:
 
-- **Split by video.** Train, validation, and test sets are disjoint on video ID.
+- **Split by source video.** The notebook groups clips by source YouTube ID before splitting (protocol `source_video_grouped_v1`), so train, validation, and test share no source video. The library's `split_by_video_id` (used by `scripts/train.py`) still splits on clip ID.
 - **Prespecified alpha.** The fusion weight alpha is fixed (default 0.5) before fine-tuning and shared by every arm. The validation alpha sweep is a sensitivity report only and never changes the test configuration.
 
 ## Status
@@ -112,7 +112,7 @@ The project uses the [MSVD (Microsoft Research Video Description) corpus](https:
 
 **Videos.** The notebook downloads the official video archive (`YouTubeClips.tar`, about 1.7 GiB) when it is not already present. It checks the MD5 checksum and then extracts and verifies all 1,970 clips. Downloads resume if interrupted.
 
-**Captions.** The notebook reads the official annotation file, `MSR Video Description Corpus.csv`, from `<DATA_ROOT>/data/extracted/annotations/`. This file is **not downloaded automatically** yet; place it there yourself. Only English captions are used. The notebook keeps the 80,838 English caption rows that match an extracted video.
+**Captions.** The notebook reads the English annotation file `AllVideoDescriptions.txt` (one `<VideoID>_<Start>_<End> caption` per line) from `<DATA_ROOT>/data/extracted/annotations/`, the working directory, or `/content`; on Colab it asks for an upload if none is found. Any malformed line stops the cell and is written to `invalid_annotation_rows.csv`. The file is **not downloaded automatically**.
 
 The command-line scripts use a simpler layout set in YAML:
 
@@ -160,7 +160,7 @@ The scripts download model weights on first use.
 
 ## Evaluation
 
-The evaluator reports BLEU-1 to BLEU-4, METEOR, ROUGE-L, and CIDEr. CIDEr is computed when `pycocoevalcap` is installed (it is in the `analysis` extra).
+The evaluator reports BLEU-1 to BLEU-4, METEOR, ROUGE-L, and CIDEr. CIDEr needs `pycocoevalcap` (in the `analysis` extra): the library records it as `NaN` when the package is missing, while the notebook stops with an error.
 
 Metric caveats:
 
@@ -181,7 +181,7 @@ Notebook Section 0 reads these environment variables, all optional:
 |---|---|
 | `MSVD_DATA_ROOT` | `/content/msvd` |
 | `MSVD_VIDEO_DIR` | `YouTubeClips` |
-| `MSVD_CAPTION_FILE` | `captions.csv` |
+| `MSVD_CAPTION_FILE` | `data/extracted/annotations/AllVideoDescriptions.txt` |
 | `OUTPUT_DIR` | `/content/video_captioning_outputs` |
 
 The command-line scripts read YAML only and do not use these variables.
@@ -200,18 +200,18 @@ GitHub Actions runs flake8 and pytest on Python 3.10, 3.11, and 3.12 for every p
 
 - **No committed results yet.** Metric values depend on running the notebook on MSVD.
 - **Fine-tuned test results are pending.** The fine-tuned arms are trained and their checkpoints are selected on validation loss, but they have not been evaluated on the test split.
-- **Split granularity.** The split is by clip ID. Clips cut from the same YouTube video can share scenes, so a near-duplicate could fall in a different split. A split by YouTube ID is planned (see `notebooks/TODO.md`).
+- **Split granularity differs.** The notebook splits by source YouTube ID. The library and `scripts/train.py` split by clip ID, so clips cut from one YouTube video can land in different splits there.
 - **Metric tokenization** (`lowercase_ascii_alphanumeric_v1`) differs from published MSVD evaluation (see [Evaluation](#evaluation)).
 - **Package pins.** The notebook records the installed versions but does not yet enforce the pins in `requirements.txt`. The most recent recorded Colab run used newer versions of some packages.
-- **Colab defaults.** Section 0 defaults to `/content/...` paths and the archive search also checks `/content`. Outside Colab, set the environment variables in [Configuration](#configuration).
-- **Annotation CSV** must be placed manually (see [Data](#data)).
+- **Colab defaults.** Section 0 defaults to `/content/...` paths, the annotation search also checks `/content`, and the annotation upload and final ZIP download use `google.colab`. Outside Colab, set the environment variables in [Configuration](#configuration) and place the annotation file yourself.
+- **Annotation file** (`AllVideoDescriptions.txt`) is not downloaded automatically (see [Data](#data)).
 - **Scope.** This is a research codebase. It has no serving API or deployment target.
 
 ## Contributing
 
 Changes should keep to these rules:
 
-- split by unique video ID, never by caption row
+- split by source video (notebook) or unique clip ID (library), never by caption row
 - keep choices made on validation data separate from test-set reporting
 - keep configuration in one place
 - write outputs to deterministic artifact paths

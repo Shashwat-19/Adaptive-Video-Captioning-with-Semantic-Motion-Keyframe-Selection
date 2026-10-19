@@ -6,7 +6,7 @@ Long videos contain many near-duplicate frames. Processing every decoded frame w
 
 ## Input representation and candidate generation
 
-The workflow reads MSVD-style caption tables and video files. Caption columns are normalized to `video_id` and `caption`; splits are made by unique video ID to avoid caption-level leakage. OpenCV then decodes a temporally spaced set of candidate frames. The current default is 30 candidates, but it is configuration-driven.
+The workflow reads MSVD-style caption tables and video files. Caption columns are normalized to `video_id` and `caption`; the notebook splits by source YouTube ID (all clips of one source video share a split) and the library splits by clip ID; both avoid caption-level leakage. OpenCV then decodes a temporally spaced set of candidate frames. The current default is 30 candidates, but it is configuration-driven.
 
 ## Motion relevance
 
@@ -32,11 +32,11 @@ Each selected frame is captioned at the full 224 px input of `Salesforce/blip2-o
 
 ## Training and fine-tuning
 
-The repository includes an opt-in BLIP-2 fine-tuning path that follows the notebook: batch size one, gradient accumulation, automatic mixed precision when CUDA is available, validation loss tracking, early stopping after two non-improving validation epochs, and optional LoRA adapters targeting `q_proj` and `v_proj`. One reference caption per video is randomly selected for each sample. Full fine-tuning has not been run or benchmarked in this repository.
+The repository includes an opt-in BLIP-2 fine-tuning path modelled on the notebook (the library masks only padding labels, while the notebook also masks image tokens and bounds captions with EOS): batch size one, gradient accumulation, automatic mixed precision when CUDA is available, validation loss tracking, early stopping after two non-improving validation epochs, and optional LoRA adapters targeting `q_proj` and `v_proj`. Training draws one random reference per video each epoch; validation uses the first reference. Full fine-tuning has not been run or benchmarked in this repository.
 
 ## Evaluation methodology
 
-The implemented evaluator calculates BLEU-1 through BLEU-4, METEOR, and ROUGE-L using each video's available reference captions. CIDEr is calculated only when the optional `pycocoevalcap` package is installed (it is part of the `analysis` extra and `requirements.txt`); otherwise it is recorded as unavailable. All metrics score captions and references after the internal protocol `lowercase_ascii_alphanumeric_v1` (lowercase, ASCII letters and digits only) and ROUGE-L is unstemmed, so scores are not directly comparable to published coco-caption or MSVD numbers. CIDEr's IDF weights come from the references of the evaluated set, so CIDEr should only be compared across methods scored on the same video IDs. Alpha is prespecified (default 0.5) and shared by training, validation and test for every arm. The validation alpha sweep is a sensitivity report only; by default it uses captions from the zero-shot base model. The fine-tuned arms are scored on the test set only through the checkpoints frozen with the configuration (path and file hash), on the same paired video IDs as the zero-shot ablation methods. No numerical results are currently committed.
+The implemented evaluator calculates BLEU-1 through BLEU-4, METEOR, and ROUGE-L using each video's available reference captions. CIDEr is calculated only when the optional `pycocoevalcap` package is installed (it is part of the `analysis` extra and `requirements.txt`); otherwise the library records it as NaN and the notebook raises an error. All metrics score captions and references after the internal protocol `lowercase_ascii_alphanumeric_v1` (lowercase, ASCII letters and digits only) and ROUGE-L is unstemmed, so scores are not directly comparable to published coco-caption or MSVD numbers. CIDEr's IDF weights come from the references of the evaluated set, so CIDEr should only be compared across methods scored on the same video IDs. Alpha is prespecified (default 0.5) and shared by training, validation and test for every arm. The validation alpha sweep is a sensitivity report only; by default it uses captions from the zero-shot base model. The fine-tuned arms are scored on the test set only through the checkpoints frozen with the configuration (path and file hash), on the same paired video IDs as the zero-shot ablation methods. No numerical results are currently committed.
 
 ## Limitations
 
