@@ -22,7 +22,7 @@ cells = [
 md(r'''
 # Efficient Video Captioning using Adaptive Semantic-Motion Keyframe Selection
 
-**MSVD + BLIP-2 research workflow.** This Colab-compatible notebook implements reproducible video-level splits, frame-selection ablations, T4-conscious LoRA fine-tuning, test-set-safe tuning, automatic evaluation, and artifact tracking. Set the paths in Section 0, run the smoke test, then enable the full experiments deliberately.
+**MSVD + BLIP-2 research workflow.** This Colab-compatible notebook implements reproducible source-video-grouped splits, frame-selection ablations, T4-conscious LoRA fine-tuning, a validation-only alpha sensitivity report, automatic evaluation, and artifact tracking. Records the active runtime and installs missing dependencies; model compatibility is checked by the validation smoke test. Set the paths in Section 0. A default run now performs a validation smoke test; full training and test studies remain opt-in. Enable `RUN_TEST_ABLATIONS` for the zero-shot study, optionally `RUN_FINETUNING` for both trained arms, and `RUN_VALIDATION_ALPHA_SWEEP` to report alpha sensitivity (alpha stays at the prespecified `ALPHA` for every arm). The notebook freezes the configuration before requested test studies. Use a fresh output directory for a new experiment. Saved outputs are cleared because the revised protocol requires a new run.
 '''),
 md(r'''
 # 0. Research Configuration
@@ -37,7 +37,7 @@ class ResearchConfig:
     # Configurable MSVD paths; can be set directly or overridden by environment variables.
     DATA_ROOT: str = os.environ.get("MSVD_DATA_ROOT", "/content/msvd")
     VIDEO_DIR: str = os.environ.get("MSVD_VIDEO_DIR", "YouTubeClips")
-    CAPTION_FILE: str = os.environ.get("MSVD_CAPTION_FILE", "captions.csv")
+    CAPTION_FILE: str = os.environ.get("MSVD_CAPTION_FILE", "data/extracted/annotations/AllVideoDescriptions.txt")
     OUTPUT_DIR: str = os.environ.get("OUTPUT_DIR", "/content/video_captioning_outputs")
     SEED: int = 42
     NUM_CANDIDATE_FRAMES: int = 30
@@ -50,6 +50,11 @@ class ResearchConfig:
     LEARNING_RATE: float = 1e-4
     NUM_EPOCHS: int = 3
     MAX_CAPTION_LENGTH: int = 32
+    MAX_TRAIN_CAPTION_TOKENS: int = 32  # caption targets including EOS, excluding BOS/image tokens
+    NUM_BEAMS: int = 3
+    CAPTION_PROMPT: str = ""  # unconditional captioning in both training and inference
+    SEMANTIC_MODEL_NAME: str = "facebook/dinov2-small"
+    FRAME_BUDGETS: tuple = (4, 8, 12, 16)
     NUM_WORKERS: int = 0  # GPU preprocessing runs in the main process
     MODEL_NAME: str = "Salesforce/blip2-opt-2.7b"
     TRAIN_RATIO: float = 0.80
@@ -59,12 +64,27 @@ class ResearchConfig:
     USE_4BIT: bool = False  # enable only if bitsandbytes is available and necessary
     SMOKE_TEST_VIDEOS: int = 4
     MAX_TRAIN_VIDEOS: int | None = None  # e.g. 100 for a fast pilot
+    RUN_SMOKE_TEST: bool = True
     RUN_FULL_METADATA: bool = False
+    RUN_VALIDATION_ALPHA_SWEEP: bool = False
+    RUN_EFFICIENCY_ANALYSIS: bool = False
+    RUN_QUALITATIVE_ANALYSIS: bool = False
     RUN_FINETUNING: bool = False
     RUN_TEST_ABLATIONS: bool = False
     RUN_FRAME_BUDGET_STUDY: bool = False
 
+# Clear prior in-memory experiment tables when rerunning Section 0.
+for variable in ["ablation","budget_results","alpha_validation","efficiency","qualitative","smoke_predictions"]:
+    globals().pop(variable,None)
 CFG = ResearchConfig()
+if CFG.CAPTION_PROMPT:
+    raise ValueError("This notebook trains unconditional captions; CAPTION_PROMPT must be empty.")
+if CFG.NUM_WORKERS != 0:
+    raise ValueError("GPU frame preprocessing requires NUM_WORKERS=0.")
+if CFG.USE_4BIT and not CFG.USE_LORA:
+    raise ValueError("Quantized fine-tuning requires LoRA.")
+RUN_ID = os.environ.get("EXPERIMENT_RUN_ID", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+MODE = "research"
 ROOT = Path(CFG.DATA_ROOT)
 VIDEO_ROOT = ROOT / CFG.VIDEO_DIR
 CAPTION_PATH = ROOT / CFG.CAPTION_FILE
@@ -79,6 +99,165 @@ with open(OUT / "configs/experiment_config.json", "w") as f:
 print(json.dumps(asdict(CFG), indent=2))
 '''),
 md(r'''
+# 1. Environment and GPU Setup
+'''),
+code(r'''
+# Optional Drive mount: it is never forced, and local /content data works unchanged.
+MOUNT_GOOGLE_DRIVE = False
+if MOUNT_GOOGLE_DRIVE:
+    from google.colab import drive
+    drive.mount("/content/drive")
+'''),
+code(r'''
+import importlib.util
+import importlib.metadata as importlib_metadata
+import subprocess
+import sys
+import platform
+import json
+import random
+from pathlib import Path
+
+# Keep Colab's installed Python, PyTorch, and CUDA stack.
+# Install missing dependencies instead of enforcing older, incompatible pins.
+required = {
+    "transformers": "transformers",
+    "accelerate": "accelerate",
+    "peft": "peft",
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "sklearn": "scikit-learn",
+    "cv2": "opencv-python-headless",
+    "PIL": "Pillow",
+    "matplotlib": "matplotlib",
+    "seaborn": "seaborn",
+    "tqdm": "tqdm",
+    "yaml": "PyYAML",
+    "rouge_score": "rouge-score==0.1.2",
+    "wordcloud": "wordcloud",
+    "sentencepiece": "sentencepiece",
+    "nltk": "nltk",
+    "pycocoevalcap": "pycocoevalcap==1.2",
+}
+if CFG.USE_4BIT:
+    required["bitsandbytes"] = "bitsandbytes"
+
+if importlib.util.find_spec("torch") is None:
+    raise RuntimeError(
+        "PyTorch is missing. Select a Colab GPU runtime before continuing."
+    )
+
+missing = [
+    package
+    for module, package in required.items()
+    if importlib.util.find_spec(module) is None
+]
+print("Missing packages:", missing or "none")
+
+if missing:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "--upgrade-strategy", "only-if-needed",
+        *missing,
+    ])
+    importlib.invalidate_caches()
+
+import torch
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image, ImageDraw
+from tqdm.auto import tqdm
+from collections import Counter
+from IPython.display import display
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(CFG.SEED)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+if CFG.USE_4BIT and device != "cuda":
+    raise RuntimeError(
+        "USE_4BIT=True requires a supported CUDA GPU runtime."
+    )
+
+if device == "cuda":
+    props = torch.cuda.get_device_properties(0)
+    print(f"GPU name: {torch.cuda.get_device_name(0)}")
+    print(f"GPU memory: {props.total_memory / 2**30:.2f} GB")
+else:
+    print("GPU name: CPU (CUDA unavailable)")
+    print("GPU memory: n/a")
+
+print(f"Python: {platform.python_version()}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"PyTorch: {torch.__version__}")
+print(f"OpenCV: {cv2.__version__}")
+# Several OpenCV wheels all ship the cv2 package, so distribution metadata alone can name a version that is not the one imported.
+cv2_distributions = sorted(
+    {
+        name
+        for d in importlib_metadata.distributions()
+        for name in [d.metadata.get("Name")]  # .get avoids the KeyError newer Pythons raise for a missing field
+        if name and any(str(f).split("/")[0] == "cv2" for f in (d.files or []))
+    }
+)
+if len(cv2_distributions) > 1:
+    print(f"WARNING: several packages provide cv2 {cv2_distributions}; trust the imported version above, not the package table.")
+
+# Record the actual environment rather than claiming compatibility
+# with the project's older pinned stack.
+versions = {}
+packages = {
+    spec.split("==")[0] for spec in required.values()
+} | {"torch", "opencv-python", "opencv-contrib-python"}
+
+for package in sorted(packages):
+    try:
+        versions[package] = importlib_metadata.version(package)
+    except importlib_metadata.PackageNotFoundError:
+        versions[package] = None
+
+version_report = {
+    "environment_policy": "preserve_runtime_install_missing",
+    "python": platform.python_version(),
+    "platform": platform.platform(),
+    "packages": versions,
+    "cv2_imported_version": cv2.__version__,
+    "cv2_distributions": cv2_distributions,
+    "cuda_available": torch.cuda.is_available(),
+    "cuda_version": torch.version.cuda,
+    "device": device,
+    "gpu_name": (
+        torch.cuda.get_device_name(0)
+        if torch.cuda.is_available() else None
+    ),
+    "model_workflow_verified": False,
+}
+
+OUT = Path(OUT)
+(OUT / "configs").mkdir(parents=True, exist_ok=True)
+(OUT / "configs/environment_versions.json").write_text(
+    json.dumps(version_report, indent=2),
+    encoding="utf-8",
+)
+
+print(json.dumps(version_report, indent=2))
+print(
+    "Environment recorded. Run the validation smoke test before training; "
+    "this setup check does not verify BLIP-2/LoRA compatibility."
+)
+'''),
+md(r'''
 # 0b. Architecture Diagram
 
 Renders the proposed pipeline (candidate sampling -> semantic/motion scoring -> fusion -> temporal diversity -> BLIP-2 -> evaluation) and saves it to `results/figures/architecture.png` for the paper.
@@ -91,7 +270,7 @@ import matplotlib.patches as mpatches
 boxes = [
     "MSVD videos + captions",
     "Dataset verification & preprocessing",
-    "Split by unique video ID",
+    "Split by source YouTube video",
     "Candidate frame sampling",
     "Semantic scoring + Motion scoring",
     "Score fusion (alpha × semantic + (1 − alpha) × motion)",
@@ -171,15 +350,7 @@ ax.set_title(
     pad=16,
 )
 
-# Support either the newer ROOT structure or the earlier OUT structure.
-if "ROOT" in globals():
-    figure_directory = Path(ROOT) / "artifacts/figures"
-elif "OUT" in globals():
-    figure_directory = Path(OUT) / "results/figures"
-else:
-    figure_directory = Path(
-        "/content/efficient_video_captioning/artifacts/figures"
-    )
+figure_directory = OUT / "results/figures"
 
 figure_directory.mkdir(parents=True, exist_ok=True)
 figure_path = figure_directory / "architecture.png"
@@ -197,124 +368,6 @@ plt.close(fig)
 print(f"Saved architecture figure: {figure_path}")
 '''),
 md(r'''
-# 1. Environment and GPU Setup
-'''),
-code(r'''
-# Optional Drive mount: it is never forced, and local /content data works unchanged.
-MOUNT_GOOGLE_DRIVE = False
-if MOUNT_GOOGLE_DRIVE:
-    from google.colab import drive
-    drive.mount("/content/drive")
-'''),
-code(r'''
-import importlib.util, subprocess, sys
-required = {"transformers":"transformers==4.45.2", "accelerate":"accelerate==0.34.2", "peft":"peft==0.12.0",
-            "cv2":"opencv-python-headless==4.10.0.84", "rouge_score":"rouge-score==0.1.2", "evaluate":"evaluate==0.4.3",
-            "wordcloud":"wordcloud==1.9.3", "sentencepiece":"sentencepiece==0.2.0", "nltk":"nltk==3.9.1", "kagglehub":"kagglehub"}
-missing = [spec for module, spec in required.items() if importlib.util.find_spec(module) is None]
-print("Missing packages:", missing or "none")
-if missing:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
-
-import torch, numpy as np, pandas as pd, cv2, matplotlib.pyplot as plt, seaborn as sns
-from PIL import Image, ImageDraw
-from tqdm.auto import tqdm
-from sklearn.model_selection import train_test_split
-from collections import Counter
-from IPython.display import display
-warnings.filterwarnings("ignore")
-
-def seed_everything(seed=42):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
-seed_everything(CFG.SEED)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-if torch.cuda.is_available():
-    props = torch.cuda.get_device_properties(0)
-    print(f"GPU name: {torch.cuda.get_device_name(0)}\nGPU memory: {props.total_memory/2**30:.2f} GB")
-else: print("GPU name: CPU (CUDA unavailable)\nGPU memory: n/a")
-print(f"CUDA available: {torch.cuda.is_available()}\nPyTorch: {torch.__version__}")
-print("OpenCV:", cv2.__version__)
-
-# Persist the exact runtime environment for reproducibility (paper appendix / rerun diffing).
-import platform, importlib.metadata as importlib_metadata
-version_report = {
-    "python": platform.python_version(),
-    "platform": platform.platform(),
-    "torch": torch.__version__,
-    "cuda_available": torch.cuda.is_available(),
-    "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
-    "opencv": cv2.__version__,
-}
-for pkg in ["transformers", "accelerate", "peft", "numpy", "pandas", "scikit-learn", "nltk", "rouge-score", "evaluate", "kagglehub"]:
-    try: version_report[pkg] = importlib_metadata.version(pkg)
-    except importlib_metadata.PackageNotFoundError: version_report[pkg] = "not installed"
-with open(OUT / "configs/environment_versions.json", "w") as f: json.dump(version_report, f, indent=2)
-with open(OUT / "configs/requirements_report.txt", "w") as f:
-    f.write("\n".join(f"{k}=={v}" for k, v in version_report.items()))
-print(json.dumps(version_report, indent=2))
-'''),
-md(r'''
-# 1b. Dataset Acquisition (Kaggle)
-
-Downloads MSVD from Kaggle (`vtrnanh/msvd-dataset-corpus`) via `kagglehub` when `CFG.DATA_ROOT` is not already populated (e.g. because Drive was mounted above or the dataset was uploaded manually). The downloaded layout is auto-detected so Section 0's `VIDEO_DIR`/`CAPTION_FILE` never need to be hand-edited for the Kaggle mirror.
-'''),
-code(r'''
-# Automatic MSVD acquisition via kagglehub. Skips cleanly if DATA_ROOT is already populated
-# (e.g. you mounted Drive above) or if USE_KAGGLE_DOWNLOAD is turned off.
-USE_KAGGLE_DOWNLOAD = True
-KAGGLE_DATASET_ID = "vtrnanh/msvd-dataset-corpus"
-
-def _looks_populated(root: Path) -> bool:
-    if not root.exists():
-        return False
-    video_like = next((p for p in root.rglob("*") if p.suffix.lower() in
-                        {".avi", ".mp4", ".webm", ".mov", ".mkv"}), None)
-    return video_like is not None
-
-def _autodetect_layout(root: Path):
-    """Kaggle mirrors don't always match YouTubeClips/captions.csv exactly, so search for them."""
-    video_exts = {".avi", ".mp4", ".webm", ".mov", ".mkv"}
-    video_dirs = {}
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in video_exts:
-            video_dirs[p.parent] = video_dirs.get(p.parent, 0) + 1
-    video_dir = max(video_dirs, key=video_dirs.get) if video_dirs else None
-    caption_candidates = [p for p in root.rglob("*") if p.is_file()
-                           and p.suffix.lower() in {".csv", ".tsv", ".json"}
-                           and any(s in p.name.lower() for s in ("caption", "description", "corpus", "annotation"))]
-    caption_file = caption_candidates[0] if caption_candidates else None
-    return video_dir, caption_file
-
-if not _looks_populated(ROOT) and USE_KAGGLE_DOWNLOAD:
-    try:
-        import kagglehub
-        print(f"DATA_ROOT ({ROOT}) has no videos yet -- downloading {KAGGLE_DATASET_ID} via kagglehub...")
-        downloaded_path = Path(kagglehub.dataset_download(KAGGLE_DATASET_ID))
-        print("kagglehub cached the dataset at:", downloaded_path)
-        video_dir, caption_file = _autodetect_layout(downloaded_path)
-        if video_dir is None:
-            print("WARNING: no video files found in the downloaded dataset; leaving DATA_ROOT unchanged. "
-                  "Inspect", downloaded_path, "and set CFG.DATA_ROOT/VIDEO_DIR/CAPTION_FILE manually in Section 0.")
-        else:
-            ROOT = downloaded_path
-            VIDEO_ROOT = video_dir
-            CFG.DATA_ROOT = str(ROOT)
-            CFG.VIDEO_DIR = str(video_dir.relative_to(ROOT))
-            if caption_file is not None:
-                CAPTION_PATH = caption_file
-                CFG.CAPTION_FILE = str(caption_file.relative_to(ROOT))
-            print(f"Resolved VIDEO_DIR -> {VIDEO_ROOT}")
-            print(f"Resolved CAPTION_FILE -> {CAPTION_PATH if caption_file else '(not auto-detected; set CFG.CAPTION_FILE manually)'}")
-            with open(OUT / "configs/experiment_config.json", "w") as f:
-                json.dump(asdict(CFG), f, indent=2)
-    except Exception as exc:
-        print(f"Kaggle acquisition skipped/failed ({type(exc).__name__}: {exc}). "
-              "Set CFG.DATA_ROOT to a manually mounted/uploaded MSVD path in Section 0 instead.")
-else:
-    print("Using existing DATA_ROOT:" if _looks_populated(ROOT) else "Kaggle download disabled; using DATA_ROOT:", ROOT)
-'''),
-md(r'''
 # 2. Dataset Loading and Verification
 '''),
 code(r'''
@@ -328,7 +381,7 @@ import subprocess
 import tarfile
 
 ROOT = Path(ROOT)
-CONTENT_ROOT = Path("/content")
+CONTENT_ROOT = ROOT
 
 MSVD_VIDEO_URL = (
     "https://www.cs.utexas.edu/~ml/clamp/"
@@ -340,7 +393,7 @@ MSVD_VIDEO_MD5 = "9bdb20fcf14d59524a6febca9f6a8d89"
 MSVD_EXPECTED_VIDEOS = 1970
 
 RAW_DIRECTORY = ROOT / "data/raw"
-VIDEO_ROOT = ROOT / "data/extracted/videos"
+VIDEO_ROOT = ROOT / CFG.VIDEO_DIR
 VIDEO_DIR = VIDEO_ROOT
 
 RAW_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -686,12 +739,14 @@ def safely_extract_msvd(
     )
 
 
-video_archive = locate_valid_existing_archive()
-
-if video_archive is None:
-    video_archive = download_video_archive()
-
-safely_extract_msvd(video_archive, VIDEO_ROOT)
+existing_videos = [p for p in VIDEO_ROOT.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES]
+if len(existing_videos) < MSVD_EXPECTED_VIDEOS:  # also resumes an interrupted extraction
+    video_archive = locate_valid_existing_archive()
+    if video_archive is None:
+        video_archive = download_video_archive()
+    safely_extract_msvd(video_archive, VIDEO_ROOT)
+else:
+    print(f"Using configured video directory: {VIDEO_ROOT} ({len(existing_videos)} files)")
 
 video_paths = {}
 
@@ -728,209 +783,126 @@ Only matched video IDs enter the split. Inspect the saved unmatched-ID lists bef
 '''),
 code(r'''
 from pathlib import Path
-import re
+from dataclasses import asdict
+import json
 
 import numpy as np
 import pandas as pd
 from IPython.display import display
 
-ROOT = Path(ROOT)
-
-# Preserve the notebook's existing OUT path when available.
-if "OUT" in globals():
-    OUT = Path(OUT)
-else:
-    OUT = ROOT / "artifacts"
-
+ROOT = Path(CFG.DATA_ROOT)
+OUT = Path(CFG.OUTPUT_DIR)
 METRICS_DIR = OUT / "results/metrics"
 METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Resolve the official annotation file.
-caption_candidates = [
-    ROOT
-    / "data/extracted/annotations"
-    / "MSR Video Description Corpus.csv",
-    Path("/content/efficient_video_captioning")
-    / "data/extracted/annotations"
-    / "MSR Video Description Corpus.csv",
-    Path("/content/msvd")
-    / "data/extracted/annotations"
-    / "MSR Video Description Corpus.csv",
-]
-
-CAPTION_PATH = next(
-    (path for path in caption_candidates if path.is_file()),
-    None,
-)
-
-if CAPTION_PATH is None:
-    discovered = sorted(
-        path
-        for path in Path("/content").rglob(
-            "MSR Video Description Corpus.csv"
-        )
-        if path.is_file()
-    )
-
-    if not discovered:
-        raise FileNotFoundError(
-            "The extracted MSVD annotation CSV was not found. "
-            "Run the automatic annotation download cell first."
-        )
-
-    CAPTION_PATH = discovered[0]
-
-print(f"Using captions: {CAPTION_PATH}")
-
-raw_captions = pd.read_csv(
-    CAPTION_PATH,
-    encoding="utf-8-sig",
-    engine="python",
-    on_bad_lines="warn",
-)
-
-required_columns = {
-    "VideoID",
-    "Start",
-    "End",
-    "Language",
-    "Description",
-}
-missing_columns = required_columns - set(raw_captions.columns)
-
-if missing_columns:
-    raise ValueError(
-        f"Official annotation file is missing columns: "
-        f"{sorted(missing_columns)}"
-    )
-
-
-def normalize_segment(value: object) -> str:
-    """Convert 33, 33.0, or '33.0' consistently to '33'."""
-    if pd.isna(value):
-        raise ValueError("Missing Start or End value")
-
-    text = str(value).strip()
-
-    try:
-        number = float(text)
-
-        if not np.isfinite(number):
-            raise ValueError(f"Invalid segment value: {value!r}")
-
-        if number.is_integer():
-            return str(int(number))
-
-        return format(number, "g")
-
-    except (TypeError, ValueError):
-        return text
-
-
-# Keep every English caption from the official corpus.
-english_mask = (
-    raw_captions["Language"]
-    .astype(str)
-    .str.strip()
-    .str.casefold()
-    .eq("english")
-)
-
-captions = raw_captions.loc[english_mask].copy()
-
-captions["video_id"] = (
-    captions["VideoID"].astype(str).str.strip()
-    + "_"
-    + captions["Start"].map(normalize_segment)
-    + "_"
-    + captions["End"].map(normalize_segment)
-)
-
-captions["caption_raw"] = captions["Description"].where(
-    captions["Description"].notna(),
-    "",
-).astype(str)
-
-captions["caption_clean"] = (
-    captions["caption_raw"]
-    .str.replace(r"\s+", " ", regex=True)
-    .str.strip()
-)
-
-# Retain the shorter column name for compatibility with older cells.
-captions["caption"] = captions["caption_clean"]
-
-captions = captions.loc[
-    captions["video_id"].ne("")
-    & captions["caption_clean"].ne("")
-].reset_index(drop=True)
-
-# Rebuild video_paths if the runtime was restarted.
 if "video_paths" not in globals() or not video_paths:
-    video_directory_candidates = [
-        Path(globals().get(
-            "VIDEO_ROOT",
-            ROOT / "data/extracted/videos",
-        )),
-        ROOT / "data/extracted/videos",
-        Path("/content/efficient_video_captioning")
-        / "data/extracted/videos",
-        Path("/content/msvd") / "data/extracted/videos",
+    raise RuntimeError("Run Section 2 first to index the video files.")
+
+# Reuse the uploaded TXT, including Colab's renamed copies.
+candidates = []
+for directory in [Path.cwd(), Path("/content")]:
+    if directory.is_dir():
+        candidates.extend(directory.glob("AllVideoDescriptions*.txt"))
+
+candidates.extend(ROOT.rglob("AllVideoDescriptions*.txt"))
+candidates = sorted({
+    path.resolve() for path in candidates if path.is_file()
+})
+
+configured_path = ROOT / CFG.CAPTION_FILE
+if configured_path.is_file() and configured_path.suffix.lower() == ".txt":
+    CAPTION_PATH = configured_path.resolve()
+elif candidates:
+    # Prefer the exact filename over renamed upload copies.
+    exact = [p for p in candidates if p.name == "AllVideoDescriptions.txt"]
+    choices = exact or candidates
+    if len(choices) != 1:
+        raise ValueError(
+            "Multiple annotation files found. Set CFG.CAPTION_FILE "
+            f"to the intended absolute path: {list(map(str, choices))}"
+        )
+    CAPTION_PATH = choices[0]
+else:
+    from google.colab import files
+
+    print("Upload AllVideoDescriptions.txt.")
+    uploaded = files.upload()
+    names = [
+        name for name in uploaded
+        if Path(name).suffix.lower() == ".txt"
     ]
+    if len(names) != 1:
+        raise ValueError("Upload exactly one annotation TXT file.")
 
-    video_extensions = {
-        ".avi",
-        ".mp4",
-        ".webm",
-        ".mov",
-        ".mkv",
-        ".mpg",
-        ".mpeg",
-    }
+    CAPTION_PATH = ROOT / "data/extracted/annotations/AllVideoDescriptions.txt"
+    CAPTION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CAPTION_PATH.write_bytes(uploaded[names[0]])
+    CAPTION_PATH = CAPTION_PATH.resolve()
 
-    available_directories = []
+print(f"Using annotations: {CAPTION_PATH}")
 
-    for directory in video_directory_candidates:
-        if not directory.is_dir():
+# Official reconstructed format:
+# video_id_start_end caption text
+# Header/comment lines begin with '#'.
+records = []
+invalid_rows = []
+
+with CAPTION_PATH.open(encoding="utf-8-sig") as handle:
+    for line_number, line in enumerate(handle, start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
 
-        count = sum(
-            1
-            for path in directory.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in video_extensions
-        )
+        try:
+            video_id, caption_raw = line.split(maxsplit=1)
 
-        if count:
-            available_directories.append((count, directory))
+            # Split from the right because source YouTube IDs may contain '_'.
+            source_video_id, start_text, end_text = video_id.rsplit("_", 2)
+            start, end = float(start_text), float(end_text)
 
-    if not available_directories:
-        raise FileNotFoundError(
-            "No extracted MSVD videos were found. "
-            "Run the automatic video download/extraction cell first."
-        )
+            if (
+                not source_video_id
+                or not np.isfinite(start)
+                or not np.isfinite(end)
+                or start < 0
+                or end <= start
+            ):
+                raise ValueError("Invalid source ID or segment bounds")
 
-    _, VIDEO_ROOT = max(
-        available_directories,
-        key=lambda item: item[0],
+            caption_clean = " ".join(caption_raw.split())
+            if not caption_clean:
+                raise ValueError("Empty caption")
+
+            records.append({
+                "video_id": video_id,
+                "source_video_id": source_video_id,
+                "Start": start,
+                "End": end,
+                "Language": "English",
+                "caption_raw": caption_raw,
+                "caption_clean": caption_clean,
+                "caption": caption_clean,
+            })
+        except ValueError as exc:
+            invalid_rows.append({
+                "line_number": line_number,
+                "text": line,
+                "error": str(exc),
+            })
+
+if invalid_rows:
+    invalid_path = METRICS_DIR / "invalid_annotation_rows.csv"
+    pd.DataFrame(invalid_rows).to_csv(invalid_path, index=False)
+    raise ValueError(
+        f"{len(invalid_rows)} malformed annotation lines. "
+        f"Inspect {invalid_path}."
     )
 
-    video_paths = {}
+if not records:
+    raise ValueError("No captions were parsed from the annotation file.")
 
-    for path in sorted(VIDEO_ROOT.rglob("*")):
-        if (
-            not path.is_file()
-            or path.suffix.lower() not in video_extensions
-        ):
-            continue
-
-        if path.stem in video_paths:
-            raise ValueError(
-                f"Duplicate video ID {path.stem!r}: "
-                f"{video_paths[path.stem]} and {path}"
-            )
-
-        video_paths[path.stem] = path
+raw_captions = pd.DataFrame(records)
+captions = raw_captions.copy()
 
 caption_id_set = set(captions["video_id"])
 video_id_set = set(video_paths)
@@ -939,100 +911,73 @@ available_captions = captions.loc[
     captions["video_id"].isin(video_id_set)
 ].copy()
 
-missing_video_ids = sorted(
-    caption_id_set - video_id_set
-)
-missing_caption_ids = sorted(
-    video_id_set - caption_id_set
-)
+missing_video_ids = sorted(caption_id_set - video_id_set)
+missing_caption_ids = sorted(video_id_set - caption_id_set)
 
-pd.DataFrame({
-    "video_id": missing_video_ids
-}).to_csv(
-    METRICS_DIR / "missing_video_ids.csv",
-    index=False,
+pd.DataFrame({"video_id": missing_video_ids}).to_csv(
+    METRICS_DIR / "missing_video_ids.csv", index=False
 )
-
-pd.DataFrame({
-    "video_id": missing_caption_ids
-}).to_csv(
-    METRICS_DIR / "missing_caption_ids.csv",
-    index=False,
+pd.DataFrame({"video_id": missing_caption_ids}).to_csv(
+    METRICS_DIR / "missing_caption_ids.csv", index=False
 )
 
 coverage = pd.DataFrame([{
-    "raw_annotation_rows": int(len(raw_captions)),
-    "english_caption_rows": int(len(captions)),
-    "captioned_video_ids": int(
-        captions["video_id"].nunique()
-    ),
-    "video_files": int(len(video_paths)),
-    "matched_video_ids": int(
-        available_captions["video_id"].nunique()
-    ),
-    "unmatched_caption_ids": int(
-        len(missing_video_ids)
-    ),
-    "uncaptioned_video_files": int(
-        len(missing_caption_ids)
-    ),
-    "matched_caption_rows": int(
-        len(available_captions)
-    ),
+    "annotation_format": "reconstructed_english_txt",
+    "raw_annotation_rows": len(raw_captions),
+    "english_caption_rows": len(captions),
+    "captioned_video_ids": captions["video_id"].nunique(),
+    "source_video_ids": captions["source_video_id"].nunique(),
+    "video_files": len(video_paths),
+    "matched_video_ids": available_captions["video_id"].nunique(),
+    "unmatched_caption_ids": len(missing_video_ids),
+    "uncaptioned_video_files": len(missing_caption_ids),
+    "matched_caption_rows": len(available_captions),
 }])
-
-coverage.to_csv(
-    METRICS_DIR / "dataset_coverage.csv",
-    index=False,
-)
-
+coverage.to_csv(METRICS_DIR / "dataset_coverage.csv", index=False)
 display(coverage)
 
 if available_captions.empty:
     raise ValueError(
-        "No caption IDs match the video filenames. "
-        "Inspect ID normalization and dataset layout."
+        "No annotation IDs match the video filenames. "
+        "Inspect missing_video_ids.csv and missing_caption_ids.csv."
     )
 
-# Downstream cells should use captions backed by available videos.
-captions = available_captions.reset_index(drop=True)
+# Record the annotation path actually used.
+CFG.CAPTION_FILE = str(CAPTION_PATH)
+(OUT / "configs").mkdir(parents=True, exist_ok=True)
+(OUT / "configs/experiment_config.json").write_text(
+    json.dumps(asdict(CFG), indent=2),
+    encoding="utf-8",
+)
 
+captions = available_captions.reset_index(drop=True)
 print(
     f"Ready: {len(captions):,} English captions for "
-    f"{captions['video_id'].nunique():,} matched videos."
+    f"{captions['video_id'].nunique():,} matched clips from "
+    f"{captions['source_video_id'].nunique():,} source videos."
 )
 '''),
 md(r'''
-# 3. Exploratory Data Analysis
-'''),
-code(r'''
-import re
-from wordcloud import WordCloud
-FIG = OUT / "results/figures"
-def savefig(name):
-    plt.tight_layout(); plt.savefig(FIG / name, dpi=220, bbox_inches="tight"); plt.show()
-captions["word_count"] = captions.caption.str.findall(r"[A-Za-z']+").str.len()
-words = [w.lower() for text in captions.caption for w in re.findall(r"[A-Za-z']+", text)]
-freq = Counter(words)
-fig, ax = plt.subplots(figsize=(8,4)); sns.histplot(captions.word_count, bins=30, ax=ax); ax.set(title="Caption length distribution", xlabel="Words per caption", ylabel="Caption records"); ax.grid(alpha=.25); savefig("caption_length_histogram.png")
-fig, ax = plt.subplots(figsize=(7,3)); sns.boxplot(x=captions.word_count, ax=ax); ax.set(title="Caption word-count boxplot", xlabel="Words per caption", ylabel="Count"); ax.grid(alpha=.25); savefig("caption_wordcount_boxplot.png")
-top = pd.DataFrame(freq.most_common(20), columns=["word","count"]); fig, ax = plt.subplots(figsize=(10,5)); sns.barplot(data=top, x="count", y="word", ax=ax); ax.set(title="Top 20 words", xlabel="Frequency", ylabel="Word"); ax.grid(axis="x", alpha=.25); savefig("top_words.png")
-ranked = sorted(freq.values(), reverse=True); fig, ax = plt.subplots(figsize=(7,4)); ax.loglog(range(1,len(ranked)+1), ranked); ax.set(title="Word frequency distribution", xlabel="Word rank (log)", ylabel="Frequency (log)"); ax.grid(alpha=.25); savefig("word_frequency_distribution.png")
-fig, ax = plt.subplots(figsize=(9,5)); ax.imshow(WordCloud(width=1200,height=600,background_color="white").generate_from_frequencies(freq)); ax.axis("off"); ax.set_title("MSVD caption word cloud"); savefig("wordcloud.png")
-counts = captions.groupby("video_id").size(); fig, ax = plt.subplots(figsize=(7,4)); sns.histplot(counts, bins=30, ax=ax); ax.set(title="Captions per video", xlabel="Captions", ylabel="Videos"); ax.grid(alpha=.25); savefig("captions_per_video.png")
-'''),
-md(r'''
-# 4. Dataset Splitting
+# 3. Dataset Splitting (source-video groups)
 '''),
 code(r'''
 def split_by_video_id(frame, train_ratio=.8, val_ratio=.1, test_ratio=.1, seed=42):
-    if not np.isclose(train_ratio + val_ratio + test_ratio, 1): raise ValueError("Split ratios must sum to 1.")
-    ids = np.array(sorted(frame.video_id.unique()))
-    if len(ids) < 20: raise ValueError("At least 20 matched videos are needed for nonempty 80/10/10 splits.")
-    train_ids, holdout = train_test_split(ids, test_size=val_ratio+test_ratio, random_state=seed, shuffle=True)
-    val_ids, test_ids = train_test_split(holdout, test_size=test_ratio/(val_ratio+test_ratio), random_state=seed, shuffle=True)
-    sets = {"train":set(train_ids), "validation":set(val_ids), "test":set(test_ids)}
-    assert not (sets["train"] & sets["validation"] or sets["train"] & sets["test"] or sets["validation"] & sets["test"])
+    """Split source YouTube IDs, then expand to clips. Ratios apply to source groups."""
+    ratios = np.asarray([train_ratio, val_ratio, test_ratio], dtype=float)
+    if not np.isfinite(ratios).all() or (ratios <= 0).any() or not np.isclose(ratios.sum(), 1):
+        raise ValueError("Split ratios must be positive and sum to 1.")
+    mapping = frame[["video_id", "source_video_id"]].drop_duplicates()
+    if mapping.video_id.duplicated().any(): raise ValueError("A clip maps to multiple source videos")
+    sources = np.array(sorted(mapping.source_video_id.unique()))
+    rng = np.random.default_rng(seed); rng.shuffle(sources)
+    n_train = int(len(sources) * train_ratio); n_val = int(len(sources) * val_ratio)
+    if min(n_train, n_val, len(sources)-n_train-n_val) < 1:
+        raise ValueError("Too few source videos for nonempty splits with these ratios.")
+    groups = {"train":set(sources[:n_train]), "validation":set(sources[n_train:n_train+n_val]),
+              "test":set(sources[n_train+n_val:])}
+    sets = {name:set(mapping.loc[mapping.source_video_id.isin(ids), "video_id"]) for name,ids in groups.items()}
+    assert not (groups["train"] & groups["validation"] or groups["train"] & groups["test"] or groups["validation"] & groups["test"])
+    assert set.union(*sets.values()) == set(frame.video_id)
     return sets
 
 # Only videos that can actually be evaluated enter the experiment split.
@@ -1041,11 +986,38 @@ split_names = {"train":"train_video_ids.csv", "validation":"val_video_ids.csv", 
 rows=[]
 for name, ids in splits.items():
     pd.DataFrame({"video_id":sorted(ids)}).to_csv(OUT / split_names[name], index=False)
-    rows.append({"Split":name, "Unique Videos":len(ids), "Caption Records":available_captions.video_id.isin(ids).sum()})
+    rows.append({"Split":name, "Unique Videos":len(ids), "Source Videos":available_captions.loc[available_captions.video_id.isin(ids), "source_video_id"].nunique(), "Caption Records":available_captions.video_id.isin(ids).sum()})
 split_table=pd.DataFrame(rows); display(split_table)
-split_metadata={k:sorted(v) for k,v in splits.items()}
+source_counts = available_captions[["video_id", "source_video_id"]].drop_duplicates().groupby("source_video_id").size()
+print(f"Sources with multiple clips: {(source_counts > 1).sum()} of {len(source_counts)}")
+split_metadata={"protocol":"source_video_grouped_v1", "seed":CFG.SEED,
+                "ratios":[CFG.TRAIN_RATIO, CFG.VAL_RATIO, CFG.TEST_RATIO],
+                "clip_ids":{k:sorted(v) for k,v in splits.items()},
+                "source_ids":{k:sorted(available_captions.loc[available_captions.video_id.isin(v), "source_video_id"].unique()) for k,v in splits.items()}}
+available_captions[["video_id", "source_video_id"]].drop_duplicates().to_csv(OUT / "configs/clip_source_mapping.csv", index=False)
 with open(OUT / "configs/split_metadata.json", "w") as f: json.dump(split_metadata, f, indent=2)
 print("Verified: train ∩ validation = train ∩ test = validation ∩ test = ∅")
+'''),
+md(r'''
+# 4. Exploratory Data Analysis (train only)
+'''),
+code(r'''
+eda_captions = captions.loc[captions.video_id.isin(splits["train"])].copy()
+print("EDA scope: training captions only")
+import re
+from wordcloud import WordCloud
+FIG = OUT / "results/figures"
+def savefig(name):
+    plt.tight_layout(); plt.savefig(FIG / name, dpi=220, bbox_inches="tight"); plt.show()
+eda_captions["word_count"] = eda_captions.caption.str.findall(r"[A-Za-z']+").str.len()
+words = [w.lower() for text in eda_captions.caption for w in re.findall(r"[A-Za-z']+", text)]
+freq = Counter(words)
+fig, ax = plt.subplots(figsize=(8,4)); sns.histplot(eda_captions.word_count, bins=30, ax=ax); ax.set(title="Caption length distribution", xlabel="Words per caption", ylabel="Caption records"); ax.grid(alpha=.25); savefig("caption_length_histogram.png")
+fig, ax = plt.subplots(figsize=(7,3)); sns.boxplot(x=eda_captions.word_count, ax=ax); ax.set(title="Caption word-count boxplot", xlabel="Words per caption", ylabel="Count"); ax.grid(alpha=.25); savefig("caption_wordcount_boxplot.png")
+top = pd.DataFrame(freq.most_common(20), columns=["word","count"]); fig, ax = plt.subplots(figsize=(10,5)); sns.barplot(data=top, x="count", y="word", ax=ax); ax.set(title="Top 20 words", xlabel="Frequency", ylabel="Word"); ax.grid(axis="x", alpha=.25); savefig("top_words.png")
+ranked = sorted(freq.values(), reverse=True); fig, ax = plt.subplots(figsize=(7,4)); ax.loglog(range(1,len(ranked)+1), ranked); ax.set(title="Word frequency distribution", xlabel="Word rank (log)", ylabel="Frequency (log)"); ax.grid(alpha=.25); savefig("word_frequency_distribution.png")
+fig, ax = plt.subplots(figsize=(9,5)); ax.imshow(WordCloud(width=1200,height=600,background_color="white").generate_from_frequencies(freq)); ax.axis("off"); ax.set_title("MSVD caption word cloud"); savefig("wordcloud.png")
+counts = eda_captions.groupby("video_id").size(); fig, ax = plt.subplots(figsize=(7,4)); sns.histplot(counts, bins=30, ax=ax); ax.set(title="Captions per video", xlabel="Captions", ylabel="Videos"); ax.grid(alpha=.25); savefig("captions_per_video.png")
 '''),
 md(r'''
 # 5. Video Preprocessing
@@ -1069,11 +1041,12 @@ def build_video_metadata(paths, run_all=False):
     meta=pd.DataFrame(records); meta.to_csv(OUT/"results/video_metadata.csv", index=False); return meta
 
 video_metadata=build_video_metadata(video_paths, CFG.RUN_FULL_METADATA)
-display(video_metadata.head()); print("Unreadable videos logged:", (~video_metadata.readable).sum())
+display(video_metadata.head()); metadata_scope=f"inspected {len(video_metadata)} of {len(video_paths)} videos"
+print(f"{metadata_scope}; unreadable within inspected set: {(~video_metadata.readable).sum()}")
 if not video_metadata.empty:
     for col, title, xlab in [("duration_s","Video duration distribution","Duration (seconds)"),("fps","FPS distribution","FPS"),("frame_count","Frame-count distribution","Frames")]:
-        fig,ax=plt.subplots(figsize=(7,4)); sns.histplot(video_metadata.loc[video_metadata.readable,col].dropna(), bins=25, ax=ax); ax.set(title=title,xlabel=xlab,ylabel="Videos"); ax.grid(alpha=.25); savefig(f"{col}_distribution.png")
-    fig,ax=plt.subplots(figsize=(7,4)); sns.scatterplot(data=video_metadata[video_metadata.readable],x="width",y="height",ax=ax); ax.set(title="Resolution distribution",xlabel="Width (pixels)",ylabel="Height (pixels)"); ax.grid(alpha=.25); savefig("resolution_distribution.png")
+        fig,ax=plt.subplots(figsize=(7,4)); sns.histplot(video_metadata.loc[video_metadata.readable,col].dropna(), bins=25, ax=ax); ax.set(title=f"{title} ({metadata_scope})",xlabel=xlab,ylabel="Videos"); ax.grid(alpha=.25); savefig(f"{col}_distribution.png")
+    fig,ax=plt.subplots(figsize=(7,4)); sns.scatterplot(data=video_metadata[video_metadata.readable],x="width",y="height",ax=ax); ax.set(title=f"Resolution distribution ({metadata_scope})",xlabel="Width (pixels)",ylabel="Height (pixels)"); ax.grid(alpha=.25); savefig("resolution_distribution.png")
 '''),
 md(r'''
 # 6. Candidate Frame Extraction
@@ -1096,11 +1069,16 @@ def extract_candidate_frames(video_path, num_frames):
     finally: cap.release()
 
 def cached_candidates(video_id):
-    cache=OUT / "cache" / f"{video_id}_n{CFG.NUM_CANDIDATE_FRAMES}_s{CFG.IMAGE_SIZE}_candidates.npz"
+    # Invalidate thumbnails if a source video is replaced at the same path.
+    import hashlib
+    source=video_paths[video_id]; stat=source.stat()
+    identity=hashlib.sha256(f"{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()[:16]
+    cache=OUT / "cache" / f"{video_id}_{identity}_n{CFG.NUM_CANDIDATE_FRAMES}_s{CFG.IMAGE_SIZE}_candidates.npz"
     # Cache compact thumbnails, not thousands of source images.
     if cache.exists():
         z=np.load(cache, allow_pickle=False); return [Image.fromarray(x) for x in z["frames"]], z["indices"].tolist(), z["times"].tolist()
     frames,indices,times=extract_candidate_frames(video_paths[video_id], CFG.NUM_CANDIDATE_FRAMES)
+    if not frames: raise ValueError(f"No decodable candidate frames for {video_id}")
     thumbs=np.stack([np.asarray(f.resize((CFG.IMAGE_SIZE,CFG.IMAGE_SIZE))) for f in frames])
     np.savez_compressed(cache,frames=thumbs,indices=np.array(indices),times=np.array(times))
     return [Image.fromarray(x) for x in thumbs],indices,times
@@ -1121,11 +1099,14 @@ md(r'''
 code(r'''
 def uniform_selection(indices, k):
     return np.asarray(indices)[np.unique(np.linspace(0,len(indices)-1,min(k,len(indices)),dtype=int))].tolist()
+def video_seed(video_id):
+    import zlib  # crc32 is stable across processes; hash() is salted per run
+    return CFG.SEED+zlib.crc32(str(video_id).encode())
 def random_selection(indices, k, seed=42):
     rng=np.random.default_rng(seed); return sorted(rng.choice(np.asarray(indices),size=min(k,len(indices)),replace=False).tolist())
 if sample_video_id:
     plot_timeline(sample_indices,uniform_selection(sample_indices,CFG.NUM_SELECTED_FRAMES),"Uniform frame sampling")
-    plot_timeline(sample_indices,random_selection(sample_indices,CFG.NUM_SELECTED_FRAMES,CFG.SEED),"Random frame sampling")
+    plot_timeline(sample_indices,random_selection(sample_indices,CFG.NUM_SELECTED_FRAMES,video_seed(sample_video_id)),"Random frame sampling")
 '''),
 md(r'''
 # 8. Motion-Based Frame Selection
@@ -1143,6 +1124,7 @@ def motion_scores(frames):
     for prev,cur in zip(gray[:-1],gray[1:]):
         flow=cv2.calcOpticalFlowFarneback(prev,cur,None,.5,3,15,3,5,1.2,0)
         score.append(float(np.linalg.norm(flow,axis=2).mean()))
+    if len(score)>1: score[0]=score[1]  # frame 0 has no predecessor; reuse the first interval so it is not always the minimum
     return minmax(score)
 
 if sample_video_id:
@@ -1159,7 +1141,7 @@ semantic_processor=None; semantic_model=None
 def load_semantic_encoder():
     global semantic_processor, semantic_model
     if semantic_model is None:
-        name="facebook/dinov2-small"  # lightweight, caption-independent frozen vision encoder
+        name=CFG.SEMANTIC_MODEL_NAME  # lightweight, caption-independent frozen vision encoder
         semantic_processor=AutoImageProcessor.from_pretrained(name)
         semantic_model=AutoModel.from_pretrained(name).to(device).eval()
     return semantic_processor,semantic_model
@@ -1172,7 +1154,9 @@ def semantic_scores(frames, batch_size=16):
         inputs=processor(images=frames[start:start+batch_size],return_tensors="pt").to(device)
         emb=model(**inputs).last_hidden_state[:,0].float(); vectors.append(torch.nn.functional.normalize(emb,dim=-1).cpu())
     emb=torch.cat(vectors).numpy(); novelty=np.zeros(len(emb))
-    if len(emb)>1: novelty[1:]=1-(emb[1:]*emb[:-1]).sum(axis=1)
+    if len(emb)>1:
+        novelty[1:]=1-(emb[1:]*emb[:-1]).sum(axis=1)
+        novelty[0]=novelty[1]  # frame 0 has no predecessor; reuse the first interval so it is not always the minimum
     return minmax(novelty),emb
 
 if sample_video_id:
@@ -1206,10 +1190,11 @@ def select_diverse_keyframes(indices, scores, timestamps, k, min_temporal_distan
     chosen=sorted(chosen)
     return [indices[i] for i in chosen], [float(scores[i]) for i in chosen], [float(timestamps[i]) for i in chosen]
 
-def select_from_candidates(frames, indices, times, method, k, alpha):
+def select_from_candidates(frames, indices, times, method, k, alpha, seed=None):
     if not frames: raise ValueError("No decodable candidate frames")
+    if k <= 0: raise ValueError("Frame budget must be positive")
     if method=="uniform": selected=uniform_selection(indices,k); score=np.zeros(len(indices))
-    elif method=="random": selected=random_selection(indices,k,CFG.SEED); score=np.zeros(len(indices))
+    elif method=="random": selected=random_selection(indices,k,CFG.SEED if seed is None else seed); score=np.zeros(len(indices))
     elif method=="motion": score=motion_scores(frames)
     elif method=="semantic": score,_=semantic_scores(frames)
     elif method in {"semantic_motion","semantic_motion_diverse"}:
@@ -1228,7 +1213,7 @@ def select_frames(video_id, method, k=None, alpha=None):
     alpha=CFG.ALPHA if alpha is None else alpha
     if k <= 0 or not 0 <= alpha <= 1: raise ValueError("k must be positive and alpha must be in [0, 1]")
     frames,indices,times=cached_candidates(video_id)
-    return select_from_candidates(frames,indices,times,method,k,alpha)
+    return select_from_candidates(frames,indices,times,method,k,alpha,seed=video_seed(video_id))
 
 if sample_video_id:
     _,chosen,_,_=select_frames(sample_video_id,"semantic_motion_diverse")
@@ -1238,15 +1223,34 @@ md(r'''
 # 12. BLIP-2 Model Setup
 '''),
 code(r'''
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
+from transformers import Blip2Processor, Blip2ForConditionalGeneration, BitsAndBytesConfig
 
-def make_contact_sheet(frames, image_size=224):
-    """A deterministic visual storyboard lets one-image BLIP-2 consume all K selected frames."""
-    if not frames: raise ValueError("No decoded frames")
-    cols=math.ceil(math.sqrt(len(frames))); rows=math.ceil(len(frames)/cols)
-    sheet=Image.new("RGB",(cols*image_size,rows*image_size),(0,0,0))
-    for i,frame in enumerate(frames): sheet.paste(frame.convert("RGB").resize((image_size,image_size)),((i%cols)*image_size,(i//cols)*image_size))
-    return sheet
+def consensus_caption(captions):
+    """Keep the per-frame caption that shares the most words with the others, so one odd frame does not set the output."""
+    captions=[c.strip() for c in captions if c.strip()]
+    if not captions: raise RuntimeError("BLIP-2 produced no non-empty frame caption")
+    words=[set(c.lower().replace("."," ").split()) for c in captions]
+    def agreement(i): return sum(len(words[i]&w)/max(1,len(words[i]|w)) for j,w in enumerate(words) if j!=i)
+    return captions[max(range(len(captions)),key=agreement)]
+
+def synchronize_blip2_processor(processor, model):
+    """Keep image placeholders aligned with the loaded BLIP-2 checkpoint."""
+    tokenizer=processor.tokenizer
+    processor.num_query_tokens=model.config.num_query_tokens
+    token=getattr(processor, "image_token", "<image>")
+    token=str(token)
+    image_id=tokenizer.convert_tokens_to_ids(token)
+    if image_id is None or image_id == tokenizer.unk_token_id:
+        tokenizer.add_special_tokens({"additional_special_tokens":[token]})
+        image_id=tokenizer.convert_tokens_to_ids(token)
+    if len(tokenizer) > model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+    configured=getattr(model.config, "image_token_index", None)
+    if configured is not None and configured != image_id:
+        raise RuntimeError(f"Processor/model image token mismatch: {image_id} vs {configured}")
+    model.config.image_token_index=image_id
+    tokenizer.padding_side="right"
+    return processor
 
 class BLIP2VideoCaptioner:
     def __init__(self, config):
@@ -1258,17 +1262,24 @@ class BLIP2VideoCaptioner:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         if device=="cuda": print(f"Loading {self.cfg.MODEL_NAME} in fp16; free GPU memory: {(torch.cuda.mem_get_info()[0]/2**30):.2f} GB")
         kwargs={"torch_dtype":torch.float16 if device=="cuda" else torch.float32}
-        if self.cfg.USE_4BIT: kwargs.update(load_in_4bit=True, device_map="auto")
+        if self.cfg.USE_4BIT:
+            if device != "cuda": raise RuntimeError("4-bit loading requires a supported CUDA runtime")
+            kwargs.update(quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16), device_map="auto")
         self.processor=Blip2Processor.from_pretrained(self.cfg.MODEL_NAME)
         self.model=Blip2ForConditionalGeneration.from_pretrained(self.cfg.MODEL_NAME, **kwargs)
         if not self.cfg.USE_4BIT: self.model.to(device)
+        synchronize_blip2_processor(self.processor,self.model)
         self.model.eval(); self.loaded_source=self.cfg.MODEL_NAME; return self
-    def prepare_frames(self, frames): return make_contact_sheet(frames,self.cfg.IMAGE_SIZE)
     @torch.inference_mode()
-    def generate_caption(self, frames, prompt="A short video of"):
-        sheet=self.prepare_frames(frames); inputs=self.processor(images=sheet,text=prompt,return_tensors="pt").to(device, torch.float16 if device=="cuda" else torch.float32)
-        tokens=self.model.generate(**inputs,max_new_tokens=self.cfg.MAX_CAPTION_LENGTH,num_beams=3)
-        return self.processor.batch_decode(tokens,skip_special_tokens=True)[0].strip()
+    def generate_caption(self, frames):
+        """Caption every selected frame at the full BLIP-2 input size in one batch, then keep the consensus caption."""
+        if not frames: raise ValueError("No decoded frames")
+        images=[f.convert("RGB") for f in frames]
+        inputs=self.processor(images=images,return_tensors="pt").to(device, torch.float16 if device=="cuda" else torch.float32)
+        tokens=self.model.generate(**inputs,max_new_tokens=self.cfg.MAX_CAPTION_LENGTH,num_beams=self.cfg.NUM_BEAMS,
+                                   eos_token_id=self.processor.tokenizer.eos_token_id,
+                                   pad_token_id=self.processor.tokenizer.pad_token_id)
+        return consensus_caption(self.processor.batch_decode(tokens,skip_special_tokens=True))
     def generate_batch(self, frame_batches): return [self.generate_caption(x) for x in frame_batches]
     def save_checkpoint(self, path, extra=None):
         Path(path).mkdir(parents=True,exist_ok=True); self.model.save_pretrained(path); self.processor.save_pretrained(path); json.dump(extra or {},open(Path(path)/"metadata.json","w"),indent=2)
@@ -1281,9 +1292,14 @@ class BLIP2VideoCaptioner:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         is_adapter=(path/"adapter_config.json").exists()
         source=self.cfg.MODEL_NAME if is_adapter else str(path)
-        self.processor=Blip2Processor.from_pretrained(source)
-        base=Blip2ForConditionalGeneration.from_pretrained(
-            source,torch_dtype=torch.float16 if device=="cuda" else torch.float32).to(device)
+        self.processor=Blip2Processor.from_pretrained(path)
+        kwargs={"torch_dtype":torch.float16 if device=="cuda" else torch.float32}
+        if self.cfg.USE_4BIT:
+            if device != "cuda": raise RuntimeError("4-bit loading requires CUDA")
+            kwargs.update(quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16), device_map="auto")
+        base=Blip2ForConditionalGeneration.from_pretrained(source, **kwargs)
+        if not self.cfg.USE_4BIT: base.to(device)
+        synchronize_blip2_processor(self.processor,base)
         if is_adapter:
             from peft import PeftModel
             self.model=PeftModel.from_pretrained(base,path).eval()
@@ -1305,36 +1321,82 @@ def zero_shot_smoke_test(video_ids):
     for vid in tqdm(list(video_ids)[:CFG.SMOKE_TEST_VIDEOS],desc="Zero-shot smoke test"):
         frames,indices,_,_=select_frames(vid,"uniform"); pred=captioner.generate_caption(frames)
         records.append({"video_id":vid,"sampling_method":"uniform","selected_frame_indices":json.dumps(indices),"caption":pred,"references":references_for(vid)})
-    result=pd.DataFrame(records); display(result[["video_id","selected_frame_indices","caption","references"]]); return result
+    result=pd.DataFrame(records)
+    result.to_csv(OUT/"results/generated_captions/smoke_validation.csv",index=False)
+    display(result[["video_id","selected_frame_indices","caption","references"]]); return result
 
 # Run only after paths are verified; this downloads BLIP-2 once.
-# smoke_predictions = zero_shot_smoke_test(sorted(splits["validation"] & set(video_paths)))
+LAYOUT_CAPTION=re.compile(r"\b(collages?|storyboards?|montages?|grids?|multiple images|several images|series of (?:pictures|images|photos)|set of (?:pictures|images|photos))\b",re.I)
+def check_smoke_captions(predictions):
+    """Fail on empty captions and on captions that describe an image layout instead of the event."""
+    bad=predictions[predictions.caption.str.strip().eq("")|predictions.caption.str.contains(LAYOUT_CAPTION)]
+    if len(bad): display(bad[["video_id","caption"]])
+    return not predictions.empty and len(bad)==0
+
+smoke_test_passed=False
+if CFG.RUN_SMOKE_TEST:
+    smoke_predictions = zero_shot_smoke_test(sorted(splits["validation"] & set(video_paths)))
+    assert check_smoke_captions(smoke_predictions), "Smoke test produced empty or layout-describing captions"
+    smoke_test_passed=True
+else:
+    print("Set CFG.RUN_SMOKE_TEST=True in Section 0 to verify captions before training.")
 '''),
 md(r'''
 # 14. BLIP-2 Fine-Tuning
+
+Caption targets are bounded separately from image placeholders and end in EOS. Image-placeholder and padding labels are ignored by the loss.
+
+Training and inference use unconditional captions with no text prompt. Each arm records its training alpha, configuration, and split hash. Alpha is prespecified (`ALPHA`, default 0.5) and shared by training, validation and test for every arm; the optional validation alpha sweep is a sensitivity report only and never changes it. Use `RUN_SMOKE_TEST=True` first.
 '''),
 code(r'''
 from torch.utils.data import Dataset, DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 class VideoCaptionDataset(Dataset):
-    def __init__(self, ids, method, training=True):
+    def __init__(self, ids, method, training=True, alpha=None):
+        self.alpha=CFG.ALPHA if alpha is None else alpha
         self.ids=[x for x in ids if x in video_paths]; self.method=method; self.training=training
     def __len__(self): return len(self.ids)
     def __getitem__(self,i):
-        vid=self.ids[i]; frames,_,_,_=select_frames(vid,self.method)
+        vid=self.ids[i]; frames,_,_,_=select_frames(vid,self.method,alpha=self.alpha)
         # A random ground-truth caption per video each epoch avoids duplicate-caption row sampling.
         refs=references_for(vid); caption=random.choice(refs) if self.training else refs[0]
-        return vid, make_contact_sheet(frames,CFG.IMAGE_SIZE), caption
+        # Inference captions each selected frame, so train on one selected frame: random per epoch, fixed middle frame for validation.
+        frame=random.choice(frames) if self.training else frames[len(frames)//2]
+        return vid, frame.convert("RGB"), caption
+
+def caption_token_ids(tokenizer,text,max_tokens):
+    """Bound caption tokens and retain EOS independently of image placeholders."""
+    if max_tokens < 2: raise ValueError("MAX_TRAIN_CAPTION_TOKENS must be >= 2")
+    if tokenizer.eos_token_id is None: raise RuntimeError("Caption tokenizer has no EOS token")
+    ids=tokenizer.encode(str(text).strip(),add_special_tokens=False)
+    while ids and ids[-1] == tokenizer.eos_token_id: ids.pop()
+    return ids[:max_tokens-1]+[tokenizer.eos_token_id]
+
+def mask_caption_labels(input_ids,attention_mask,image_token_index):
+    labels=input_ids.clone()
+    labels[attention_mask==0]=-100
+    if image_token_index is not None: labels[input_ids==image_token_index]=-100
+    return labels
 
 def collate_caption_batch(batch):
-    vids,images,texts=zip(*batch); inputs=captioner.processor(images=list(images),text=list(texts),padding=True,return_tensors="pt")
-    labels=inputs.input_ids.clone(); labels[labels==captioner.processor.tokenizer.pad_token_id]=-100; inputs["labels"]=labels
-    return vids, {k:v.to(device) for k,v in inputs.items()}
+    vids,images,texts=zip(*batch)
+    tokenizer=captioner.processor.tokenizer
+    image_id=captioner.model.config.image_token_index
+    prefix=[image_id]*captioner.model.config.num_query_tokens
+    bos=[] if tokenizer.bos_token_id is None else [tokenizer.bos_token_id]
+    features=[{"input_ids":prefix+bos+caption_token_ids(tokenizer,text,CFG.MAX_TRAIN_CAPTION_TOKENS)} for text in texts]
+    inputs=captioner.processor(images=list(images),return_tensors="pt")
+    tokens=tokenizer.pad(features,padding=True,return_tensors="pt")
+    inputs.update(tokens)
+    inputs["labels"]=mask_caption_labels(inputs["input_ids"],inputs["attention_mask"],image_id)
+    inputs["pixel_values"]=inputs["pixel_values"].to(torch.float16 if device=="cuda" else torch.float32)
+    return vids,{k:v.to(device) for k,v in inputs.items()}
 
 def configure_lora(model):
     if not CFG.USE_LORA: return model
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    if CFG.USE_4BIT: model=prepare_model_for_kbit_training(model)
     for p in model.parameters(): p.requires_grad=False
     config=LoraConfig(r=8,lora_alpha=16,lora_dropout=.05,target_modules=["q_proj","v_proj"],bias="none")
     model=get_peft_model(model,config); model.print_trainable_parameters(); return model
@@ -1343,28 +1405,40 @@ def gpu_memory_gb(): return torch.cuda.max_memory_allocated()/2**30 if torch.cud
 def train_one_epoch(model, loader, optimizer, scheduler, scaler):
     model.train(); running=0.; optimizer.zero_grad(set_to_none=True); start=time.perf_counter()
     for step,(_,batch) in enumerate(tqdm(loader,leave=False)):
-        with torch.cuda.amp.autocast(enabled=device=="cuda"):
-            loss=model(**batch).loss/CFG.GRADIENT_ACCUMULATION_STEPS
+        with torch.amp.autocast("cuda", enabled=device=="cuda"):
+            raw_loss=model(**batch).loss
+            if not torch.isfinite(raw_loss): raise RuntimeError("Non-finite training loss; no checkpoint is valid")
+            window_start=(step//CFG.GRADIENT_ACCUMULATION_STEPS)*CFG.GRADIENT_ACCUMULATION_STEPS
+            window_size=min(CFG.GRADIENT_ACCUMULATION_STEPS, len(loader)-window_start)
+            loss=raw_loss/window_size
         scaler.scale(loss).backward()
         if (step+1)%CFG.GRADIENT_ACCUMULATION_STEPS==0 or step+1==len(loader):
-            scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True); scheduler.step()
-        running += loss.item()*CFG.GRADIENT_ACCUMULATION_STEPS
+            scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); scale_before=scaler.get_scale(); scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+            if scaler.get_scale() >= scale_before: scheduler.step()
+        running += raw_loss.item()
     return running/max(1,len(loader)),time.perf_counter()-start
 
 @torch.no_grad()
 def validate(model,loader):
     model.eval(); losses=[]
     for _,batch in loader:
-        with torch.cuda.amp.autocast(enabled=device=="cuda"): losses.append(model(**batch).loss.item())
+        with torch.amp.autocast("cuda", enabled=device=="cuda"): losses.append(model(**batch).loss.item())
     return float(np.mean(losses)) if losses else float("nan")
 
 def save_checkpoint(model, directory, epoch, history):
-    directory=Path(directory); directory.mkdir(parents=True,exist_ok=True); model.save_pretrained(directory/f"epoch_{epoch}"); json.dump(history,open(directory/"history.json","w"),indent=2)
+    directory=Path(directory); directory.mkdir(parents=True,exist_ok=True); model.save_pretrained(directory/f"epoch_{epoch}"); captioner.processor.save_pretrained(directory/f"epoch_{epoch}"); json.dump(history,open(directory/"history.json","w"),indent=2)
 '''),
 md(r'''
 # 15. Proposed Method Fine-Tuning
 '''),
 code(r'''
+def file_digest(path):
+    import hashlib
+    digest=hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda:handle.read(8*1024*1024),b""): digest.update(chunk)
+    return digest.hexdigest()
+
 FINETUNED_ARMS={"uniform_finetuned":("uniform",OUT/"checkpoints/uniform_baseline"),
                 "proposed_finetuned":("semantic_motion_diverse",OUT/"checkpoints/proposed")}
 
@@ -1387,20 +1461,32 @@ def checkpoint_sha256(path):
 
 def run_finetuning(method, checkpoint_dir):
     """Same architecture/hyperparameters for uniform and adaptive control conditions."""
+    if CFG.NUM_EPOCHS < 1 or CFG.BATCH_SIZE < 1 or CFG.GRADIENT_ACCUMULATION_STEPS < 1:
+        raise ValueError("Epochs, batch size, and gradient accumulation must be positive.")
+    if not globals().get("smoke_test_passed",False):
+        raise RuntimeError("Run the validation smoke test successfully before fine-tuning.")
+    if (OUT/"configs/frozen_test_config.json").exists():
+        raise RuntimeError("Cannot retrain a frozen experiment. Choose a new OUTPUT_DIR.")
+    seed_everything(CFG.SEED)
+    training_alpha=CFG.ALPHA
     # A pointer left by an earlier run must not survive a run that saves nothing.
     (Path(checkpoint_dir)/"best_checkpoint.json").unlink(missing_ok=True)
     # Reload the same pretrained weights for each comparison arm.
     captioner.model=None; captioner.processor=None
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
-    captioner.load_model(); model=configure_lora(captioner.model)
+    captioner.load_model()
+    if not CFG.USE_LORA and device=="cuda": captioner.model.float()
+    model=configure_lora(captioner.model)
+    captioner.model=model
     captioner.loaded_source=f"finetuning:{method}"
     train_ids=sorted(splits["train"] & set(video_paths)); val_ids=sorted(splits["validation"] & set(video_paths))
     if CFG.MAX_TRAIN_VIDEOS: train_ids=train_ids[:CFG.MAX_TRAIN_VIDEOS]; val_ids=val_ids[:max(1,CFG.MAX_TRAIN_VIDEOS//8)]
-    train_loader=DataLoader(VideoCaptionDataset(train_ids,method),batch_size=CFG.BATCH_SIZE,shuffle=True,num_workers=CFG.NUM_WORKERS,collate_fn=collate_caption_batch)
+    train_loader=DataLoader(VideoCaptionDataset(train_ids,method),batch_size=CFG.BATCH_SIZE,shuffle=True,generator=torch.Generator().manual_seed(CFG.SEED),num_workers=CFG.NUM_WORKERS,collate_fn=collate_caption_batch)
     val_loader=DataLoader(VideoCaptionDataset(val_ids,method,training=False),batch_size=CFG.BATCH_SIZE,num_workers=CFG.NUM_WORKERS,collate_fn=collate_caption_batch)
+    if not len(train_loader) or not len(val_loader): raise ValueError("Training and validation loaders must be nonempty")
     opt=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=CFG.LEARNING_RATE)
-    steps=math.ceil(len(train_loader)/CFG.GRADIENT_ACCUMULATION_STEPS)*CFG.NUM_EPOCHS; sched=get_linear_schedule_with_warmup(opt,max(1,int(.1*steps)),max(1,steps)); scaler=torch.cuda.amp.GradScaler(enabled=device=="cuda")
+    steps=math.ceil(len(train_loader)/CFG.GRADIENT_ACCUMULATION_STEPS)*CFG.NUM_EPOCHS; sched=get_linear_schedule_with_warmup(opt,max(1,int(.1*steps)),max(1,steps)); scaler=torch.amp.GradScaler("cuda", enabled=device=="cuda")
     hist=[]; best=float("inf"); best_epoch=None; patience=0
     for epoch in range(1,CFG.NUM_EPOCHS+1):
         tr,seconds=train_one_epoch(model,train_loader,opt,sched,scaler); va=validate(model,val_loader); row={"epoch":epoch,"train_loss":tr,"val_loss":va,"lr":sched.get_last_lr()[0],"epoch_time_s":seconds}; hist.append(row); print(row)
@@ -1412,7 +1498,7 @@ def run_finetuning(method, checkpoint_dir):
     # The pointer is written only after the loop finishes, so an interrupted run leaves none for a later freeze to pick up.
     if best_epoch is not None:
         (Path(checkpoint_dir)/"best_checkpoint.json").write_text(json.dumps(
-            {"method":method,"epoch":best_epoch,"val_loss":best,"path":str(Path(checkpoint_dir)/f"epoch_{best_epoch}")},indent=2))
+            {"method":method,"training_alpha":training_alpha,"training_config":asdict(CFG),"split_sha256":file_digest(OUT/"configs/split_metadata.json"),"annotation_sha256":file_digest(CAPTION_PATH),"epoch":best_epoch,"val_loss":best,"path":str(Path(checkpoint_dir)/f"epoch_{best_epoch}")},indent=2))
     pd.DataFrame(hist).to_csv(OUT/f"results/logs/{method}_training.csv",index=False)
     fig,ax=plt.subplots(figsize=(7,4)); pd.DataFrame(hist).plot(x="epoch",y=["train_loss","val_loss"],marker="o",ax=ax); ax.set(title=f"{method}: training and validation loss",xlabel="Epoch",ylabel="Loss"); ax.grid(alpha=.25); savefig(f"{method}_training_curve.png")
     return hist
@@ -1425,14 +1511,30 @@ md(r'''
 # 16. Caption Generation
 '''),
 code(r'''
-def generate_for_ids(video_ids, method, alpha=None, checkpoint=None, run_tag="manual"):
+def generate_for_ids(video_ids, method, alpha=None, checkpoint=None, run_tag="manual", budget_override=False):
+    video_ids=sorted(set(video_ids))
+    if not video_ids: raise ValueError("No videos requested")
+    if set(video_ids) & splits["test"]:
+        record=assert_test_configuration_frozen(allow_budget_override=budget_override)
+        if checkpoint:
+            matching=[x for x in record["finetuned_checkpoints"].values() if x and x["path"]==str(checkpoint)]
+            if not matching: raise RuntimeError("Test checkpoint was not frozen")
+            expected=matching[0]["training_alpha"]
+            if method != matching[0]["method"]: raise RuntimeError("Test selection method differs from checkpoint training")
+        else: expected=record["config"]["ALPHA"]
+        actual=CFG.ALPHA if alpha is None else alpha
+        if actual != expected: raise RuntimeError(f"Test alpha differs from the frozen model protocol: {actual} vs {expected}")
     if checkpoint: captioner.load_checkpoint(checkpoint)
     else: captioner.load_model()
+    if method in {"semantic","semantic_motion","semantic_motion_diverse"}: load_semantic_encoder()  # model load is not selection time
     output=[]
     for vid in tqdm(list(video_ids),desc=f"Generate {method}"):
-        begin=time.perf_counter()
         try:
-            frames,indices,_,_=select_frames(vid,method,alpha=alpha)
+            candidates=cached_candidates(vid)  # decode or cache load stays untimed so the first method does not pay for the cache
+            a=CFG.ALPHA if alpha is None else alpha
+            if not 0<=a<=1: raise ValueError("alpha must be in [0, 1]")
+            begin=time.perf_counter()  # inference_time_s = frame selection + captioning
+            frames,indices,_,_=select_from_candidates(*candidates,method,CFG.NUM_SELECTED_FRAMES,a,seed=video_seed(vid))
             pred=captioner.generate_caption(frames)
             output.append({"video_id":vid,"sampling_method":method,"selected_frame_indices":json.dumps(indices),
                            "caption":pred,"error":None,"inference_time_s":time.perf_counter()-begin,
@@ -1465,15 +1567,24 @@ def generate_for_ids(video_ids, method, alpha=None, checkpoint=None, run_tag="ma
 '''),
 md(r'''
 # 17. Automatic Evaluation
+
+All metrics receive the same lowercase ASCII alphanumeric tokens (punctuation becomes a boundary; whitespace collapses). ROUGE uses that tokenizer without stemming; METEOR retains its standard matching. This is a documented internal protocol, **not PTB/coco-caption benchmark evaluation**. CIDEr is required, and methods are compared only on a saved common paired-ID set. Retrain and rerun after changing this protocol; old scores are not comparable.
 '''),
 code(r'''
 import nltk
-for resource in ["wordnet","omw-1.4"]:
+for resource in ["wordnet"]:
     try: nltk.data.find("corpora/"+resource)
     except LookupError: nltk.download(resource,quiet=True)
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
+
+import re
+def normalize_metric_caption(text):
+    return " ".join(re.findall(r"[a-z0-9]+", str(text).lower()))
+
+class MetricTokenizer:
+    def tokenize(self, text): return normalize_metric_caption(text).split()
 
 METRIC_NAMES=["BLEU-1","BLEU-2","BLEU-3","BLEU-4","METEOR","ROUGE-L","CIDEr"]
 def evaluate_captions(predictions, references):
@@ -1481,15 +1592,16 @@ def evaluate_captions(predictions, references):
     if predictions.empty or "caption" not in predictions:
         return {k:np.nan for k in METRIC_NAMES}
     if predictions.video_id.duplicated().any(): raise ValueError("Duplicate prediction video IDs")
-    ok=predictions[predictions.caption.notna() & predictions.caption.astype(str).str.strip().ne("")]
+    ok=predictions[predictions.caption.notna() & predictions.caption.map(normalize_metric_caption).ne("")]
     pairs=[(str(r.caption),references[r.video_id]) for r in ok.itertuples()
            if r.video_id in references and references[r.video_id]]
     if not pairs: return {k:np.nan for k in METRIC_NAMES}
+    pairs=[(normalize_metric_caption(p),[normalize_metric_caption(x) for x in rs]) for p,rs in pairs]
     hyp=[p.split() for p,_ in pairs]; refs=[[x.split() for x in rs] for _,rs in pairs]
     smooth=SmoothingFunction().method1
     result={f"BLEU-{n}":corpus_bleu(refs,hyp,weights=tuple([1/n]*n),smoothing_function=smooth) for n in range(1,5)}
     result["METEOR"]=float(np.mean([meteor_score([x.split() for x in rs],p.split()) for p,rs in pairs]))
-    rouge=rouge_scorer.RougeScorer(["rougeL"],use_stemmer=True)
+    rouge=rouge_scorer.RougeScorer(["rougeL"],use_stemmer=False,tokenizer=MetricTokenizer())
     result["ROUGE-L"]=float(np.mean([max(rouge.score(x,p)["rougeL"].fmeasure for x in rs) for p,rs in pairs]))
     result["CIDEr"]=np.nan
     try:
@@ -1498,25 +1610,27 @@ def evaluate_captions(predictions, references):
         res={str(i):[p] for i,(p,_) in enumerate(pairs)}
         result["CIDEr"]=Cider().compute_score(gts,res)[0]
     except ImportError:
-        print("CIDEr unavailable: install pycocoevalcap to report it.")
+        raise RuntimeError("CIDEr requires the pinned pycocoevalcap package; fix the environment before reporting results.")
     return result
 
 def paired_success_ids(prediction_tables, requested_ids):
+    if not prediction_tables: raise ValueError("No prediction tables to pair")
     common=set(requested_ids)
     for table in prediction_tables.values():
-        valid=table[table.caption.notna() & table.caption.astype(str).str.strip().ne("")]
+        valid=table[table.caption.notna() & table.caption.map(normalize_metric_caption).ne("")]  # punctuation-only captions are failures, as in src
         common &= set(valid.video_id)
+    if not common: raise ValueError("No common successful videos; inspect generation error tables")
     return sorted(common)
 
 test_references={vid:references_for(vid) for vid in splits["test"]}
 '''),
 md(r'''
-# 17b. Validation-Only Alpha Selection and Test Freeze
+# 17b. Validation Alpha Sensitivity (Report Only) and Test Freeze
 '''),
 code(r'''
 def plot_alpha_sensitivity(validation_ids, alphas=(0,.25,.5,.75,1.0), checkpoint=None):
-    """Validation-only alpha sweep. By default captions come from the zero-shot base model, so the chosen alpha is
-    tuned on the base model; pass a fine-tuned checkpoint (e.g. best_checkpoint_path(...)) to tune on that model."""
+    """Validation-only alpha sensitivity sweep; it never sets the test alpha. By default captions come from the zero-shot
+    base model; pass a fine-tuned checkpoint (e.g. best_checkpoint_path(...)) to sweep that model instead."""
     suffix="_finetuned" if checkpoint else ""
     validation_ids=sorted(set(validation_ids) & splits["validation"])
     if not validation_ids: raise ValueError("No validation videos available")
@@ -1542,40 +1656,100 @@ def plot_alpha_sensitivity(validation_ids, alphas=(0,.25,.5,.75,1.0), checkpoint
             ax.grid(alpha=.25); savefig(f"alpha_vs_{metric.lower().replace('-','_')}.png")
     return df
 
-def freeze_test_configuration(validation_results=None, primary="CIDEr", fallback="BLEU-4"):
-    if validation_results is None:
-        chosen=CFG.ALPHA; metric="prespecified"
-    else:
-        metric=primary if validation_results[primary].notna().any() else fallback
-        if not validation_results[metric].notna().any(): raise ValueError("No valid validation metric")
-        chosen=float(validation_results.loc[validation_results[metric].idxmax(),"alpha"])
-    CFG.ALPHA=chosen
+def video_manifest():
+    records=[]
+    for video_id,path in sorted(video_paths.items()):
+        stat=Path(path).stat()
+        records.append({"video_id":video_id,"path":str(Path(path).resolve()),
+                        "size":stat.st_size,"mtime_ns":stat.st_mtime_ns})
+    return records
+
+def video_manifest_sha256():
+    import hashlib
+    return hashlib.sha256(json.dumps(video_manifest(),sort_keys=True).encode()).hexdigest()
+
+TRAINING_COMPATIBILITY_FIELDS=["MODEL_NAME","SEMANTIC_MODEL_NAME","NUM_CANDIDATE_FRAMES","NUM_SELECTED_FRAMES",
+    "MIN_TEMPORAL_DISTANCE","IMAGE_SIZE","CAPTION_PROMPT","USE_LORA","USE_4BIT","SEED",
+    "MAX_TRAIN_CAPTION_TOKENS","BATCH_SIZE","GRADIENT_ACCUMULATION_STEPS","LEARNING_RATE","NUM_EPOCHS","MAX_TRAIN_VIDEOS"]
+FROZEN_FIELDS=["SEED","NUM_CANDIDATE_FRAMES","NUM_SELECTED_FRAMES","ALPHA","MIN_TEMPORAL_DISTANCE",
+               "MODEL_NAME","SEMANTIC_MODEL_NAME","IMAGE_SIZE","MAX_CAPTION_LENGTH","NUM_BEAMS",
+               "CAPTION_PROMPT","USE_LORA","USE_4BIT","FRAME_BUDGETS","DATA_ROOT","VIDEO_DIR","CAPTION_FILE"]
+
+def freeze_test_configuration(validation_results=None):
+    """Freeze the prespecified CFG.ALPHA. The validation sweep is a sensitivity report and never changes alpha,
+    so every arm trains and tests at the same value."""
+    if (OUT/"configs/frozen_test_config.json").exists():
+        raise RuntimeError("Configuration is already frozen. Use a new OUTPUT_DIR for a new experiment.")
+    chosen=CFG.ALPHA; metric="prespecified"
     # Fine-tuned checkpoints (best validation-loss epoch per arm) are frozen with the config, path and file hash;
     # None if the arm has not been trained yet.
     checkpoints={}
     for arm,(method,directory) in FINETUNED_ARMS.items():
         best=best_checkpoint_path(directory)
-        checkpoints[arm]={"method":method,"path":str(best),"sha256":checkpoint_sha256(best)} if best else None
+        metadata=json.loads((directory/"best_checkpoint.json").read_text()) if best else None
+        checkpoints[arm]={"method":method,"path":str(best),"sha256":checkpoint_sha256(best),
+                          "training_alpha":metadata["training_alpha"], "training_config":metadata["training_config"]} if best else None
+        if best:
+            mismatch=[field for field in TRAINING_COMPATIBILITY_FIELDS
+                      if metadata["training_config"].get(field) != getattr(CFG,field)]
+            if mismatch: raise RuntimeError(f"{arm} training configuration is incompatible: {mismatch}")
+            if metadata["training_alpha"] != CFG.ALPHA: raise RuntimeError(f"{arm} was trained at alpha={metadata['training_alpha']} but ALPHA={CFG.ALPHA}; every arm must share one alpha.")
+            if metadata["split_sha256"] != file_digest(OUT/"configs/split_metadata.json"):
+                raise RuntimeError(f"{arm} was trained on different splits; retrain in a new OUTPUT_DIR.")
+            if metadata.get("annotation_sha256") != file_digest(CAPTION_PATH):
+                raise RuntimeError(f"{arm} training annotations changed; retrain in a new OUTPUT_DIR.")
+    CFG.ALPHA=chosen
+    (OUT/"configs/frozen_video_manifest.json").write_text(json.dumps(video_manifest(),indent=2))
     record={"config":asdict(CFG),"selection_metric":metric,
             "validation_results":validation_results.attrs.get("source_csv","results/metrics/alpha_validation.csv") if validation_results is not None else None,
-            "alpha_tuned_on_checkpoint":validation_results.attrs.get("checkpoint") if validation_results is not None else None,
-            "finetuned_checkpoints":checkpoints}
+            "alpha_sweep_checkpoint":validation_results.attrs.get("checkpoint") if validation_results is not None else None,
+            "alpha_sweep_csv_sha256":{p.name:file_digest(p) for p in sorted((OUT/"results/metrics").glob("alpha_validation*.csv"))},  # shows whether a sweep existed before alpha was frozen
+            "finetuned_checkpoints":checkpoints,"split_sha256":file_digest(OUT/"configs/split_metadata.json"),
+            "annotation_sha256":file_digest(CAPTION_PATH),"video_manifest_sha256":video_manifest_sha256(),"metric_protocol":"lowercase_ascii_alphanumeric_v1",
+            "run_id":RUN_ID}
     with open(OUT/"configs/frozen_test_config.json","w") as f: json.dump(record,f,indent=2)
     print(f"Frozen alpha={chosen:g} using {metric}; test evaluation may now run.")
     return record
 
-def assert_test_configuration_frozen():
+def assert_test_configuration_frozen(allow_budget_override=False):
     path=OUT/"configs/frozen_test_config.json"
-    if not path.exists(): raise RuntimeError("Freeze alpha on validation (or prespecify it) before test evaluation.")
-    frozen=json.loads(path.read_text())["config"]
-    fields=["SEED","NUM_CANDIDATE_FRAMES","NUM_SELECTED_FRAMES","ALPHA","MIN_TEMPORAL_DISTANCE","MODEL_NAME"]
-    changed=[field for field in fields if field != "NUM_SELECTED_FRAMES" and frozen[field] != getattr(CFG,field)]
+    if not path.exists(): raise RuntimeError("Freeze the prespecified configuration before test evaluation.")
+    record=json.loads(path.read_text()); frozen=record["config"]
+    current=json.loads(json.dumps(asdict(CFG)))
+    changed=[field for field in FROZEN_FIELDS if frozen[field] != current[field]
+             and not (allow_budget_override and field == "NUM_SELECTED_FRAMES")]
+    if allow_budget_override and CFG.NUM_SELECTED_FRAMES not in CFG.FRAME_BUDGETS:
+        raise RuntimeError("Frame budget was not prespecified")
     if changed: raise RuntimeError(f"Test configuration changed after freeze: {changed}")
+    if record["split_sha256"] != file_digest(OUT/"configs/split_metadata.json"):
+        raise RuntimeError("Split metadata changed after freeze")
+    if record["annotation_sha256"] != file_digest(CAPTION_PATH):
+        raise RuntimeError("Annotations changed after freeze")
+    if record["video_manifest_sha256"] != video_manifest_sha256():
+        raise RuntimeError("Video paths, sizes or modification times changed after freeze")
+    for arm, checkpoint in record["finetuned_checkpoints"].items():
+        if checkpoint:
+            directory=FINETUNED_ARMS[arm][1]; current_path=best_checkpoint_path(directory)
+            if current_path is None or str(current_path)!=checkpoint["path"] or checkpoint_sha256(current_path)!=checkpoint["sha256"]:
+                raise RuntimeError(f"Frozen checkpoint changed or is missing: {arm}")
+    return record
 
-# Run one of these BEFORE enabling test ablations or the frame-budget study:
-# alpha_validation = plot_alpha_sensitivity(sorted(splits["validation"]))
-# freeze_test_configuration(alpha_validation)
-# freeze_test_configuration()  # use the prespecified CFG.ALPHA without tuning
+# Optional validation sweep (sensitivity report only); alpha is always the prespecified CFG.ALPHA.
+test_requested=any([CFG.RUN_TEST_ABLATIONS,CFG.RUN_FRAME_BUDGET_STUDY,
+                    CFG.RUN_EFFICIENCY_ANALYSIS,CFG.RUN_QUALITATIVE_ANALYSIS])
+freeze_path=OUT/"configs/frozen_test_config.json"
+if CFG.RUN_VALIDATION_ALPHA_SWEEP:
+    if freeze_path.exists(): raise RuntimeError("Cannot run the alpha sweep on a frozen experiment; use a new OUTPUT_DIR")
+    alpha_validation=plot_alpha_sensitivity(sorted(splits["validation"]))
+if test_requested:
+    if not globals().get("smoke_test_passed",False):
+        raise RuntimeError("Run the validation smoke test before test experiments")
+    if freeze_path.exists():
+        assert_test_configuration_frozen()
+    else:
+        freeze_test_configuration(alpha_validation if CFG.RUN_VALIDATION_ALPHA_SWEEP else None)
+else:
+    print("Test experiments disabled; no test metrics will be produced.")
 '''),
 md(r'''
 # 18. Ablation Study
@@ -1610,8 +1784,10 @@ def run_ablation(ids, methods=METHODS, include_finetuned=False):
         predictions[method]=generate_for_ids(ids,method,run_tag="test_ablation"); sources[method]=CFG.MODEL_NAME
     for arm,(method,checkpoint) in finetuned.items():
         if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-        predictions[arm]=generate_for_ids(ids,method,checkpoint=checkpoint,run_tag="test_finetuned"); sources[arm]=str(checkpoint)
+        training_alpha=json.loads((OUT/"configs/frozen_test_config.json").read_text())["finetuned_checkpoints"][arm]["training_alpha"]
+        predictions[arm]=generate_for_ids(ids,method,alpha=training_alpha,checkpoint=checkpoint,run_tag="test_finetuned"); sources[arm]=str(checkpoint)
     paired_ids=paired_success_ids(predictions,ids)
+    pd.DataFrame({"video_id":paired_ids}).to_csv(OUT/"results/metrics/ablation_paired_ids.csv",index=False)
     print(f"Paired test videos: {len(paired_ids)}/{len(ids)}. Failures remain in saved prediction tables.")
     rows=[]
     for name,preds in predictions.items():
@@ -1620,7 +1796,7 @@ def run_ablation(ids, methods=METHODS, include_finetuned=False):
         rows.append({"Method":name,"Frames":CFG.NUM_SELECTED_FRAMES,"Requested Videos":len(ids),
                      "Successful Videos":int(preds.caption.notna().sum()),"Paired Videos":len(paired_ids),
                      **metric,"Inference Time":paired.inference_time_s.mean(),
-                     "GPU Memory":paired.gpu_memory_gb.max(),"Checkpoint":sources[name]})
+                     "GPU Memory":paired.gpu_memory_gb.max(),"Checkpoint":sources[name],"Selection Alpha":float(preds.alpha.iloc[0]),"Evaluation Set":"ablation_paired"})
     table=pd.DataFrame(rows)
     table.to_csv(OUT/"results/metrics/ablation_metrics.csv",index=False)
     table.to_csv(OUT/"results/metrics.csv",index=False)
@@ -1642,11 +1818,16 @@ if CFG.RUN_TEST_ABLATIONS:
 '''),
 md(r'''
 # 19. Frame Budget Study
+
+This is a **frame-budget study**: every selected frame is captioned at the full 224×224 BLIP-2 input, so increasing K adds BLIP-2 passes but does not shrink any frame. Frame count is therefore not confounded with resolution. Budget results use their own common paired set and stay separate from the main ablation table.
 '''),
 code(r'''
-def frame_budget_study(ids, budgets=(4,8,12,16)):
+def frame_budget_study(ids, budgets=None):
     assert_test_configuration_frozen()
     ids=sorted(set(ids) & splits["test"])
+    budgets=CFG.FRAME_BUDGETS if budgets is None else tuple(budgets)
+    if budgets != tuple(CFG.FRAME_BUDGETS): raise ValueError("Budgets must match the prespecified frozen FRAME_BUDGETS")
+    if not budgets or any(k <= 0 or k > CFG.NUM_CANDIDATE_FRAMES for k in budgets): raise ValueError("Invalid frame budget")
     original_budget=CFG.NUM_SELECTED_FRAMES
     predictions={}
     try:
@@ -1654,9 +1835,10 @@ def frame_budget_study(ids, budgets=(4,8,12,16)):
             CFG.NUM_SELECTED_FRAMES=k
             for method in ["uniform","semantic_motion_diverse"]:
                 if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-                predictions[(k,method)]=generate_for_ids(ids,method,run_tag=f"test_budget_{k}")
+                predictions[(k,method)]=generate_for_ids(ids,method,run_tag=f"test_budget_{k}",budget_override=True)
     finally: CFG.NUM_SELECTED_FRAMES=original_budget
     paired_ids=paired_success_ids(predictions,ids)
+    pd.DataFrame({"video_id":paired_ids}).to_csv(OUT/"results/metrics/budget_paired_ids.csv",index=False)
     print(f"Paired test videos across all budgets: {len(paired_ids)}/{len(ids)}")
     records=[]
     for (k,method),preds in predictions.items():
@@ -1665,7 +1847,7 @@ def frame_budget_study(ids, budgets=(4,8,12,16)):
         records.append({"Method":method,"Frames":k,"Requested Videos":len(ids),
                         "Successful Videos":int(preds.caption.notna().sum()),"Paired Videos":len(paired_ids),
                         **metrics,"Inference Time":paired.inference_time_s.mean(),
-                        "GPU Memory":paired.gpu_memory_gb.max()})
+                        "GPU Memory":paired.gpu_memory_gb.max(),"Evaluation Set":"budget_paired"})
     df=pd.DataFrame(records); df.to_csv(OUT/"results/metrics/frame_budget.csv",index=False)
     return df
 if CFG.RUN_FRAME_BUDGET_STUDY:
@@ -1681,12 +1863,17 @@ md(r'''
 '''),
 code(r'''
 def efficiency_row(video_id, method):
-    # Cold decode plus method-specific scoring and one BLIP-2 call per video.
+    if video_id in splits["test"]: assert_test_configuration_frozen()
+    captioner.load_model()
+    if torch.cuda.is_available(): torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    # Cold decode plus method-specific scoring and one batched BLIP-2 call per video (K frames).
     start=time.perf_counter()
     frames,indices,times=extract_candidate_frames(video_paths[video_id],CFG.NUM_CANDIDATE_FRAMES)
+    frames=[f.resize((CFG.IMAGE_SIZE,CFG.IMAGE_SIZE)) for f in frames]
     extraction=time.perf_counter()-start
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     start=time.perf_counter()
-    selected,_,_,_=select_from_candidates(frames,indices,times,method,CFG.NUM_SELECTED_FRAMES,CFG.ALPHA)
+    selected,_,_,_=select_from_candidates(frames,indices,times,method,CFG.NUM_SELECTED_FRAMES,CFG.ALPHA,seed=video_seed(video_id))
     if torch.cuda.is_available(): torch.cuda.synchronize()
     selection=time.perf_counter()-start
     if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -1706,46 +1893,70 @@ def plot_efficiency(efficiency):
     ax.grid(axis="y",alpha=.25); savefig("end_to_end_runtime_comparison.png")
     return efficiency
 
-# Captioner loading is excluded from timing; use multiple test videos for a representative estimate.
-# captioner.load_model()
-# efficiency = pd.DataFrame([efficiency_row(v,m) for v in sorted(splits["test"])[:10]
-#                            for m in ["uniform","semantic_motion_diverse"]])
-# efficiency.to_csv(OUT/"results/metrics/efficiency.csv",index=False)
-# display(plot_efficiency(efficiency))
+if CFG.RUN_EFFICIENCY_ANALYSIS:
+    captioner.load_model()
+    # Warm both methods on validation, then measure test videos.
+    warmup=next(iter(sorted(splits["validation"])))
+    for method in ["uniform","semantic_motion_diverse"]: efficiency_row(warmup,method)
+    efficiency=pd.DataFrame([efficiency_row(v,m) for v in sorted(splits["test"])[:10]
+                             for m in ["uniform","semantic_motion_diverse"]])
+    efficiency.to_csv(OUT/"results/metrics/efficiency.csv",index=False)
+    display(plot_efficiency(efficiency))
 '''),
 md(r'''
 ### Interpreting runtime and frame reduction
 
-All methods use the same selected-frame budget and make **one BLIP-2 call per video** on a contact sheet. Frame reduction is therefore equal across methods at a fixed budget. Semantic scoring adds DINOv2 work and may make the proposed method slower; the research question is whether caption quality improves enough to justify that cost. Use measured end-to-end time and paired caption metrics for the tradeoff. Repeat timings after model warm-up and report hardware, video count, and variability before claiming an efficiency gain.
+All methods use the same selected-frame budget and make **one batched BLIP-2 call per video**, captioning each of the K selected frames at full resolution. Captioning cost therefore grows with K and is equal across methods at a fixed budget. Semantic scoring adds DINOv2 work and may make the proposed method slower; the research question is whether caption quality improves enough to justify that cost. Use measured end-to-end time and paired caption metrics for the tradeoff. Repeat timings after model warm-up and report hardware, video count, and variability before claiming an efficiency gain.
 '''),
 md(r'''
 # 21. Qualitative Analysis
 '''),
 code(r'''
 def qualitative_analysis(test_ids, n=5):
+    assert_test_configuration_frozen()
+    test_ids=set(test_ids) & splits["test"]
+    if not test_ids: raise ValueError("No test videos requested")
     ids=np.random.default_rng(CFG.SEED).choice(sorted(test_ids),size=min(n,len(test_ids)),replace=False)
     captioner.load_model(); records=[]
     for vid in ids:
         uni,ui,_,_=select_frames(vid,"uniform"); prop,pi,_,_=select_frames(vid,"semantic_motion_diverse")
-        fig,axes=plt.subplots(2,max(len(uni),len(prop)),figsize=(16,4))
+        fig,axes=plt.subplots(2,max(len(uni),len(prop)),figsize=(16,4),squeeze=False)
         for row,fs,title in zip(axes,[uni,prop],["Uniform","Adaptive semantic-motion"]):
-            for ax,fr in zip(row,fs): ax.imshow(fr); ax.axis("off")
-            row[0].set_ylabel(title,fontsize=11)
-        fig.suptitle(f"{vid} | References: {' | '.join(references_for(vid)[:2])}",fontsize=10); plt.tight_layout(); plt.savefig(OUT/f"results/qualitative/{vid}.png",dpi=180); plt.show()
+            for ax in row: ax.axis("off")
+            for ax,fr in zip(row,fs): ax.imshow(fr)
+            row[0].text(-0.06,0.5,title,transform=row[0].transAxes,rotation=90,ha="right",va="center",fontsize=11)  # axis("off") hides set_ylabel
+        fig.suptitle(f"{vid} | References: {' | '.join(references_for(vid)[:2])}",fontsize=10); plt.tight_layout(rect=(0.04,0,1,0.95)); plt.savefig(OUT/f"results/qualitative/{vid}.png",dpi=180); plt.show()
         records.append({"video_id":vid,"references":references_for(vid),"uniform_caption":captioner.generate_caption(uni),"proposed_caption":captioner.generate_caption(prop),"uniform_indices":ui,"proposed_indices":pi})
     return pd.DataFrame(records)
-# qualitative = qualitative_analysis(splits["test"] & set(video_paths))
+if CFG.RUN_QUALITATIVE_ANALYSIS:
+    qualitative=qualitative_analysis(splits["test"] & set(video_paths))
+    qualitative.to_csv(OUT/"results/qualitative/caption_comparison.csv",index=False)
 '''),
 md(r'''
 # 22. Final Research Results
 '''),
 code(r'''
 def final_results_table(ablation_table=None, budget_table=None):
-    frames=[x for x in [ablation_table,budget_table] if x is not None]
-    if not frames: return pd.DataFrame(columns=["Method","Frame Count","BLEU-1","BLEU-2","BLEU-3","BLEU-4","METEOR","ROUGE-L","CIDEr","Inference Time","GPU Memory","Frame Reduction"])
-    result=pd.concat(frames,ignore_index=True).rename(columns={"Frames":"Frame Count"})
-    wanted=["Method","Frame Count","BLEU-1","BLEU-2","BLEU-3","BLEU-4","METEOR","ROUGE-L","CIDEr","Inference Time","GPU Memory","Frame Reduction"]
-    result=result.reindex(columns=[c for c in wanted if c in result.columns]); result.to_csv(OUT/"results/final_results.csv",index=False); return result
+    # Budget results have a different paired set and belong in a separate file.
+    if budget_table is not None:
+        budget_table.to_csv(OUT/"results/frame_budget_results.csv",index=False)
+    if ablation_table is None or ablation_table.empty:
+        print("No frozen test ablation has been run; no final results are written.")
+        return pd.DataFrame()
+    result=ablation_table.rename(columns={"Frames":"Frame Count"}).copy()
+    result.to_csv(OUT/"results/final_results.csv",index=False)
+    return result
+workflow_status={
+    "run_id":RUN_ID,
+    "smoke_test_passed":bool(globals().get("smoke_test_passed",False)),
+    "finetuned_arms":{arm:str(best_checkpoint_path(directory)) if best_checkpoint_path(directory) else None
+                      for arm,(_,directory) in FINETUNED_ARMS.items()},
+    "test_configuration_frozen":(OUT/"configs/frozen_test_config.json").exists(),
+    "ablation_completed":"ablation" in globals(),
+    "budget_study_completed":"budget_results" in globals(),
+}
+(OUT/"configs/workflow_status.json").write_text(json.dumps(workflow_status,indent=2))
+print(json.dumps(workflow_status,indent=2))
 final_results=final_results_table(globals().get("ablation"),globals().get("budget_results")); display(final_results)
 '''),
 md(r'''
@@ -1753,7 +1964,7 @@ md(r'''
 '''),
 code(r'''
 # Config/splits/metadata, metrics, figures, generated captions, score files, qualitative figures,
-# logs, checkpoints, and final_results.csv are written under OUT. Record final config after tuning.
+# logs, checkpoints, and final_results.csv are written under OUT. Record the final runtime config.
 with open(OUT/"configs/final_runtime_config.json","w") as f: json.dump(asdict(CFG),f,indent=2)
 print("Artifacts saved under:",OUT)
 for folder in ["results/figures","results/metrics","results/generated_captions","results/frame_scores","results/qualitative","results/logs","checkpoints/uniform_baseline","checkpoints/proposed","configs"]:
@@ -1822,11 +2033,24 @@ def file_sha256(path: Path) -> str:
 
 
 # Build a reproducibility manifest before creating the ZIP.
+def keep_in_zip(path):
+    """Leave out the regenerable candidate cache and every checkpoint epoch except the best one per arm."""
+    parts = path.relative_to(OUT).parts
+    if parts[0] in ("exports", "cache"):
+        return False
+    if parts[0] == "checkpoints" and len(parts) > 2 and parts[2].startswith("epoch_"):
+        pointer = OUT / "checkpoints" / parts[1] / "best_checkpoint.json"
+        best = json.loads(pointer.read_text())["epoch"] if pointer.exists() else None
+        return parts[2] == f"epoch_{best}"
+    return True
+
+
 artifact_files = sorted(
     path
     for path in OUT.rglob("*")
     if path.is_file()
-    and "exports" not in path.relative_to(OUT).parts
+    and keep_in_zip(path)
+    and path != OUT / "configs/artifact_manifest.json"
 )
 
 manifest = {
@@ -1866,13 +2090,11 @@ temporary_archive_base = (
     / f"{OUT.name}_{timestamp}"
 )
 
-temporary_zip = Path(
-    shutil.make_archive(
-        str(temporary_archive_base),
-        "zip",
-        root_dir=OUT,
-    )
-)
+import zipfile
+temporary_zip = temporary_archive_base.with_suffix(".zip")
+with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for path in [*artifact_files, manifest_path]:
+        archive.write(path, arcname=str(path.relative_to(OUT)))
 
 final_zip = (
     OUT
@@ -1913,7 +2135,7 @@ from pathlib import Path
 import pandas as pd
 from IPython.display import display
 
-OUT = Path("/content/video_captioning_outputs")
+OUT = Path(CFG.OUTPUT_DIR)
 
 figure_directories = [
     OUT / "results/figures",
@@ -2077,13 +2299,17 @@ md(r'''
 # 24. Conclusions and Research Interpretation
 '''),
 code(r'''
-print("""Interpret results only after the planned validation selection and a single frozen-configuration test pass.
+print("""Interpret results only after a single frozen-configuration test pass.
 - Compare adaptive selection with uniform at equal frame budgets; report measured efficiency rather than inferred savings.
-- Treat CIDEr/SPICE as optional when their Java/package dependencies cannot be reproduced, and state that limitation.
-- Report the selected alpha, seed, splits, model checkpoint, and all failed/corrupted videos from saved artifacts.
+- Use the recorded normalized metric protocol; these scores are not published MSVD benchmark scores.
+- Report the prespecified alpha, seed, splits, model checkpoint, and all failed/corrupted videos from saved artifacts.
 - Do not claim a method wins from qualitative examples alone; those examples are fixed-seed random test samples.""")
 ''')
 ]
+
+for index, cell in enumerate(cells):
+    cell["id"] = f"cell-{index:03d}"  # nbformat 4.5 requires stable cell ids
+assert all(not c["outputs"] and c["execution_count"] is None for c in cells if c["cell_type"] == "code"), "run outputs must not enter the notebook"
 
 notebook = {
     "cells": cells,
