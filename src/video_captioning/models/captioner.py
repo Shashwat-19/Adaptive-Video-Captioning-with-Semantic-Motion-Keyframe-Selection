@@ -1,4 +1,4 @@
-"""BLIP-2 storyboard captioning used by the notebook and inference CLI."""
+"""BLIP-2 per-frame captioning with a consensus caption, used by the notebook and inference CLI."""
 
 from __future__ import annotations
 
@@ -6,26 +6,25 @@ from pathlib import Path
 from typing import Any
 
 
-def make_contact_sheet(frames: list, image_size: int = 224):
-    """Compose selected frames into the one-image storyboard consumed by BLIP-2."""
-    if not frames:
-        raise ValueError("No decoded frames were provided.")
-    import math
-    from PIL import Image
+def consensus_caption(captions: list[str]) -> str:
+    """Return the caption sharing the most words with the others, so one odd frame does not set the output."""
+    captions = [caption.strip() for caption in captions if caption.strip()]
+    if not captions:
+        raise RuntimeError("BLIP-2 produced no non-empty frame caption.")
+    words = [set(caption.lower().replace(".", " ").split()) for caption in captions]
 
-    columns = math.ceil(math.sqrt(len(frames)))
-    rows = math.ceil(len(frames) / columns)
-    sheet = Image.new("RGB", (columns * image_size, rows * image_size), (0, 0, 0))
-    for index, frame in enumerate(frames):
-        sheet.paste(
-            frame.convert("RGB").resize((image_size, image_size)),
-            ((index % columns) * image_size, (index // columns) * image_size),
+    def agreement(index: int) -> float:
+        return sum(
+            len(words[index] & other) / max(1, len(words[index] | other))
+            for position, other in enumerate(words)
+            if position != index
         )
-    return sheet
+
+    return captions[max(range(len(captions)), key=agreement)]
 
 
 class BLIP2VideoCaptioner:
-    """Lazy-loading BLIP-2 wrapper for captioning a selected-frame storyboard."""
+    """Lazy-loading BLIP-2 wrapper that captions each selected frame and keeps the consensus caption."""
 
     def __init__(
         self,
@@ -63,18 +62,22 @@ class BLIP2VideoCaptioner:
         self.model.eval()
         return self
 
-    def generate_caption(self, frames: list, prompt: str = "A short video of") -> str:
-        """Generate a caption for selected frames using a contact-sheet representation."""
+    def generate_caption(self, frames: list, prompt: str = "") -> str:
+        """Caption every selected frame at the full BLIP-2 input size in one batch, then return the consensus caption."""
         import torch
 
+        if not frames:
+            raise ValueError("No decoded frames were provided.")
         self.load_model()
         assert self.model is not None and self.processor is not None and self.device is not None
-        sheet = make_contact_sheet(frames, self.image_size)
+        images = [frame.convert("RGB") for frame in frames]
         dtype = torch.float16 if self.device == "cuda" else torch.float32
-        inputs = self.processor(images=sheet, text=prompt, return_tensors="pt").to(self.device, dtype)
+        # No prompt by default: fine-tuning trains on bare captions, so inference must not add one.
+        text = {"text": [prompt] * len(images)} if prompt else {}
+        inputs = self.processor(images=images, return_tensors="pt", **text).to(self.device, dtype)
         with torch.inference_mode():
             tokens = self.model.generate(**inputs, max_new_tokens=self.max_caption_length, num_beams=3)
-        return self.processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
+        return consensus_caption(self.processor.batch_decode(tokens, skip_special_tokens=True))
 
     def load_checkpoint(self, path: str | Path) -> "BLIP2VideoCaptioner":
         """Load a locally saved BLIP-2 checkpoint directory.

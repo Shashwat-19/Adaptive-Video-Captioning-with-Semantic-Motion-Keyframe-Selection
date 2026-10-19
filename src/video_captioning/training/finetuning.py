@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from video_captioning.keyframes.pipeline import select_frames_from_video
-from video_captioning.models.captioner import BLIP2VideoCaptioner, make_contact_sheet
+from video_captioning.models.captioner import BLIP2VideoCaptioner
 from video_captioning.utils.config import ExperimentConfig
 
 
@@ -67,8 +67,9 @@ def run_finetuning(
         raise ValueError("Training and validation each need at least one available video.")
 
     class VideoCaptionDataset(Dataset):
-        def __init__(self, ids: list[str]) -> None:
+        def __init__(self, ids: list[str], training: bool = True) -> None:
             self.ids = ids
+            self.training = training
             self.semantic_runtime: tuple | None = None
 
         def __len__(self) -> int:
@@ -79,7 +80,9 @@ def run_finetuning(
             selection, self.semantic_runtime = select_frames_from_video(
                 video_paths[video_id], config, semantic_runtime=self.semantic_runtime
             )
-            return video_id, make_contact_sheet(selection.frames, config.image_size), random.choice(references[video_id])
+            # Inference captions each selected frame, so train on one: random per epoch, the middle frame for validation.
+            frame = random.choice(selection.frames) if self.training else selection.frames[len(selection.frames) // 2]
+            return video_id, frame.convert("RGB"), random.choice(references[video_id]) if self.training else references[video_id][0]
 
     def collate(batch):
         video_ids, images, texts = zip(*batch)
@@ -94,7 +97,7 @@ def run_finetuning(
         num_workers=config.num_workers, collate_fn=collate
     )
     validation_loader = DataLoader(
-        VideoCaptionDataset(selected_validation), batch_size=config.batch_size,
+        VideoCaptionDataset(selected_validation, training=False), batch_size=config.batch_size,
         num_workers=config.num_workers, collate_fn=collate
     )
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config.learning_rate)
